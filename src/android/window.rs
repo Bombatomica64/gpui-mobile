@@ -1547,6 +1547,14 @@ impl PlatformWindow for AndroidPlatformWindow {
         }
     }
 
+    fn a11y_init(&self, callbacks: gpui::A11yCallbacks) {
+        super::accessibility::init(callbacks);
+    }
+
+    fn a11y_tree_update(&self, tree_update: gpui::accesskit::TreeUpdate) {
+        super::accessibility::update(tree_update);
+    }
+
     fn prompt(
         &self,
         _level: PromptLevel,

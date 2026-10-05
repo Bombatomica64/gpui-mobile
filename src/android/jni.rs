@@ -317,6 +317,8 @@ pub fn set_host_activity(env: &mut jni::Env<'_>, activity: &JObject<'_>) -> Resu
     let mut slot = HOST_ACTIVITY.lock().expect("poisoned");
     slot.previous = slot.current.take();
     slot.current = Some(global);
+    drop(slot);
+    super::accessibility::activity_changed();
     Ok(())
 }
 
