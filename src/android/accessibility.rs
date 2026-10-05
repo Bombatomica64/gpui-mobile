@@ -71,7 +71,7 @@ impl ActionHandler for Handlers {
 }
 
 /// `PlatformWindow::a11y_init`, on the GPUI thread.
-pub(crate) fn init(callbacks: A11yCallbacks) {
+pub(super) fn init(callbacks: A11yCallbacks) {
     let mut bridge = BRIDGE.lock().expect("poisoned");
     bridge
         .insert(Bridge {
@@ -82,7 +82,7 @@ pub(crate) fn init(callbacks: A11yCallbacks) {
 }
 
 /// `PlatformWindow::a11y_tree_update`, on the GPUI thread that called [`init`].
-pub(crate) fn update(tree: TreeUpdate) {
+pub(super) fn update(tree: TreeUpdate) {
     let mut bridge = BRIDGE.lock().expect("poisoned");
     let Some(adapter) = bridge.as_mut().and_then(|b| b.adapter.as_mut()) else {
         return;
@@ -93,7 +93,7 @@ pub(crate) fn update(tree: TreeUpdate) {
 }
 
 /// A new Activity was registered; move the adapter onto its views.
-pub(crate) fn activity_changed() {
+pub(super) fn activity_changed() {
     if let Some(bridge) = BRIDGE.lock().expect("poisoned").as_mut() {
         bridge.attach();
     }
