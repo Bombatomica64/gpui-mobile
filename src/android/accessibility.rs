@@ -12,11 +12,11 @@
 //! There is one GPUI window per Activity, so the state is global. A recreated Activity
 //! has new views; [`super::jni::set_host_activity`] moves the adapter onto them.
 //!
-//! Android has no "screen reader stopped" callback for this adapter, so once TalkBack
-//! has been used GPUI keeps building the tree until the process ends. Updates are
-//! dropped while accessibility is off: this adapter version raises events without
-//! checking, and Android throws on the UI thread when nobody is listening
-//! (`accesskit_android` 0.9 checks, but needs `accesskit` 0.25).
+//! This adapter version has no "screen reader stopped" callback and raises events
+//! without checking whether anyone listens, which Android answers by throwing on the
+//! UI thread (`accesskit_android` 0.9 checks, but needs `accesskit` 0.25). So each
+//! update first asks `AccessibilityManager.isEnabled()`; once it is off, GPUI is told
+//! to stop building trees and a fresh adapter waits for the next screen reader.
 
 use std::sync::{Arc, Mutex};
 
@@ -79,12 +79,20 @@ pub(super) fn init(callbacks: A11yCallbacks) {
 /// `PlatformWindow::a11y_tree_update`, on the GPUI thread that called [`init`].
 pub(super) fn update(tree: TreeUpdate) {
     let mut bridge = BRIDGE.lock().expect("poisoned");
-    let Some(adapter) = bridge.as_mut().and_then(|b| b.adapter.as_mut()) else {
+    let Some(bridge) = bridge.as_mut() else {
+        return;
+    };
+    let Some(adapter) = bridge.adapter.as_mut() else {
         return;
     };
     if adapter.is_accessibility_enabled() {
         adapter.inner.update_if_active(|| tree);
+        return;
     }
+    // The screen reader has gone. Stop GPUI building trees, and swap in an adapter
+    // that is not yet active, so the next screen reader activates GPUI again.
+    (bridge.callbacks.0.lock().expect("poisoned").deactivation)();
+    bridge.attach();
 }
 
 /// A new Activity was registered; move the adapter onto its views.
@@ -115,9 +123,10 @@ impl Bridge {
 
 impl Adapter {
     fn is_accessibility_enabled(&self) -> bool {
-        let enabled = self.vm.get_env().and_then(|mut env| {
-            env.call_method(&self.manager, "isEnabled", "()Z", &[])?.z()
-        });
+        let enabled = self
+            .vm
+            .get_env()
+            .and_then(|mut env| env.call_method(&self.manager, "isEnabled", "()Z", &[])?.z());
         enabled.unwrap_or_else(|err| {
             log::warn!("accessibility: AccessibilityManager.isEnabled failed: {err}");
             false
