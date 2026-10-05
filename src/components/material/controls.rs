@@ -290,6 +290,16 @@ impl IntoElement for Checkbox {
             .items_center()
             .cursor_pointer();
 
+        row = row
+            .role(gpui::Role::CheckBox)
+            .aria_toggled(match self.state {
+                CheckboxState::Checked => gpui::Toggled::True,
+                CheckboxState::Unchecked => gpui::Toggled::False,
+                CheckboxState::Indeterminate => gpui::Toggled::Mixed,
+            });
+        if let Some(label) = &self.label {
+            row = row.aria_label(label.clone());
+        }
         row = row.child(touch_target);
 
         if let Some(label_text) = self.label {
@@ -673,6 +683,14 @@ impl IntoElement for Switch {
             .gap(px(LABEL_GAP))
             .cursor_pointer();
 
+        row = row.role(gpui::Role::Switch).aria_toggled(if self.is_on {
+            gpui::Toggled::True
+        } else {
+            gpui::Toggled::False
+        });
+        if let Some(label) = &self.label {
+            row = row.aria_label(label.clone());
+        }
         row = row.child(track);
 
         if let Some(label_text) = self.label {
