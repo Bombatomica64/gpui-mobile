@@ -18,7 +18,7 @@ use gpui::{
     Bounds, Capslock, DevicePixels, DispatchEventResult, GpuSpecs, Modifiers, Pixels,
     PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
     PromptButton, PromptLevel, RequestFrameOptions, Scene, Size, TileId, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams,
+    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams, WindowVisibility,
 };
 use gpui_wgpu::{GpuContext, WgpuContext, WgpuRenderer, WgpuSurfaceConfig};
 use objc2::encode::{Encode, Encoding, RefEncode};
@@ -464,6 +464,8 @@ pub(crate) struct IosWindow {
     input_callback: RefCell<Option<Box<dyn FnMut(PlatformInput) -> DispatchEventResult>>>,
     /// Callback for active status changes
     active_status_callback: RefCell<Option<Box<dyn FnMut(bool)>>>,
+    /// Callback for visibility changes (follows the active status)
+    visibility_callback: RefCell<Option<Box<dyn FnMut(WindowVisibility)>>>,
     /// Callback for hover status changes (not really applicable on iOS)
     hover_status_callback: RefCell<Option<Box<dyn FnMut(bool)>>>,
     /// Callback for resize events
@@ -579,6 +581,7 @@ impl IosWindow {
                 request_frame_callback: RefCell::new(None),
                 input_callback: RefCell::new(None),
                 active_status_callback: RefCell::new(None),
+                visibility_callback: RefCell::new(None),
                 hover_status_callback: RefCell::new(None),
                 resize_callback: RefCell::new(None),
                 moved_callback: RefCell::new(None),
@@ -1264,6 +1267,13 @@ impl IosWindow {
         if let Some(callback) = self.active_status_callback.borrow_mut().as_mut() {
             callback(is_active);
         }
+        if let Some(callback) = self.visibility_callback.borrow_mut().as_mut() {
+            callback(if is_active {
+                WindowVisibility::Visible
+            } else {
+                WindowVisibility::Hidden
+            });
+        }
     }
 
     /// Handle a layout change (e.g. rotation, split-screen resize).
@@ -1540,6 +1550,18 @@ impl PlatformWindow for IosWindow {
         *self.active_status_callback.borrow_mut() = Some(callback);
     }
 
+    fn visibility(&self) -> WindowVisibility {
+        if self.is_active() {
+            WindowVisibility::Visible
+        } else {
+            WindowVisibility::Hidden
+        }
+    }
+
+    fn on_visibility_change(&self, callback: Box<dyn FnMut(WindowVisibility)>) {
+        *self.visibility_callback.borrow_mut() = Some(callback);
+    }
+
     fn on_hover_status_change(&self, callback: Box<dyn FnMut(bool)>) {
         *self.hover_status_callback.borrow_mut() = Some(callback);
     }
@@ -1598,7 +1620,7 @@ impl PlatformWindow for IosWindow {
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {
         let guard = self.renderer.lock();
-        guard.as_ref().map(|r| r.gpu_specs())
+        guard.as_ref().and_then(|r| r.gpu_specs())
     }
 
     fn update_ime_position(&self, _bounds: Bounds<Pixels>) {
@@ -1634,14 +1656,14 @@ impl FallbackAtlas {
 impl PlatformAtlas for FallbackAtlas {
     fn get_or_insert_with<'a>(
         &self,
-        key: &AtlasKey,
+        key: AtlasKey,
         build: &mut dyn FnMut() -> anyhow::Result<
             Option<(Size<DevicePixels>, std::borrow::Cow<'a, [u8]>)>,
         >,
     ) -> anyhow::Result<Option<AtlasTile>> {
         let mut state = self.state.lock();
 
-        if let Some(tile) = state.tiles.get(key) {
+        if let Some(tile) = state.tiles.get(&key) {
             return Ok(Some(tile.clone()));
         }
 
@@ -1663,7 +1685,7 @@ impl PlatformAtlas for FallbackAtlas {
                 },
             };
 
-            state.tiles.insert(key.clone(), tile.clone());
+            state.tiles.insert(key, tile.clone());
             Ok(Some(tile))
         } else {
             Ok(None)
