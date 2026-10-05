@@ -490,6 +490,18 @@ fn process_input_events(app: &AndroidApp) {
                                 }
                             };
 
+                            // GPUI does not use hover on mobile. With a screen reader on,
+                            // touch exploration arrives as hover events, which the
+                            // accessibility delegate on the decor view has to see.
+                            if matches!(
+                                action,
+                                MotionAction::HoverEnter
+                                    | MotionAction::HoverMove
+                                    | MotionAction::HoverExit
+                            ) {
+                                return android_activity::InputStatus::Unhandled;
+                            }
+
                             if hits_platform_view {
                                 log::debug!(
                                     "process_input_events: touch hits platform view, skipping GPUI dispatch",
