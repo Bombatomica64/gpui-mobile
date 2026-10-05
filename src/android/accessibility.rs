@@ -49,11 +49,6 @@ struct Adapter {
     manager: GlobalRef,
 }
 
-// SAFETY: `InjectingAdapter` holds a `JavaVM`, global/weak references and a
-// `&'static` global class reference, all valid on any thread; its methods attach to
-// the JVM and post UI work to the host `View` themselves.
-unsafe impl Send for Adapter {}
-
 /// GPUI's callbacks, shared by every adapter a recreated Activity gets.
 #[derive(Clone)]
 struct Handlers(Arc<Mutex<A11yCallbacks>>);
