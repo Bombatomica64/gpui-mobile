@@ -108,6 +108,9 @@ android-activity = { version = "0.6", features = ["native-activity"] }
 # Logging to logcat
 android_logger = "0.15"
 
+# TalkBack: exposes GPUI's AccessKit tree (accesskit 0.24, as gpui).
+accesskit_android = { version = "0.7.5", features = ["embedded-dex"] }
+
 # wgpu renderer (Vulkan backend on Android)
 gpui_wgpu = { git = "https://github.com/zed-industries/zed", rev = "a6169ca96987105be7d60a5051f3155eb6225ccc", package = "gpui_wgpu", features = ["font-kit"] }
 
