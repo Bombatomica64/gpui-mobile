@@ -28,7 +28,8 @@
 //!    after the first call).
 //! 2. From `SurfaceHolder.Callback`: [`surface_created`] in both `surfaceCreated` and
 //!    `surfaceChanged`, [`surface_destroyed`] in `surfaceDestroyed`.
-//! 3. From `onResume` / `onPause`: [`resumed`] / [`paused`].
+//! 3. From `onResume` / `onPause`: [`resumed`] / [`paused`], and from
+//!    `onConfigurationChanged` (if the Activity handles any): [`configuration_changed`].
 //! 4. From `onTouchEvent`, `dispatchKeyEvent` and the `InputConnection`:
 //!    [`motion_event`], [`key`], [`ime_event`].
 //!
@@ -98,6 +99,7 @@ enum Command {
     SurfaceDestroyed,
     Resumed,
     Paused,
+    ConfigurationChanged,
     /// Input arrives on the Java UI thread but GPUI may only be touched from the
     /// render thread, so both go through the queue like everything else.
     Touch(TouchPoint),
@@ -229,9 +231,15 @@ fn render_thread(launch: Launch) {
                 }
                 Command::Resumed => {
                     platform.did_become_active();
+                    // Night mode may have changed while another app was in front.
+                    super::jni::sync_appearance(&platform);
                     if let Some(win) = platform.primary_window() {
                         win.set_active(true);
                     }
+                }
+                Command::ConfigurationChanged => {
+                    platform.notify_keyboard_layout_change();
+                    super::jni::sync_appearance(&platform);
                 }
                 Command::Paused => {
                     platform.did_enter_background();
@@ -314,6 +322,9 @@ fn on_surface_created(
             }
             Err(err) => log::error!("gpui-main: init_window failed: {err:#}"),
         }
+        // A recreation is how an Activity that does not handle `uiMode` itself
+        // learns about a night mode change.
+        super::jni::sync_appearance(platform);
         existing.set_active(true);
         return;
     }
@@ -322,6 +333,7 @@ fn on_surface_created(
     match platform.open_window(window, scale, false) {
         Ok(win) => {
             CURRENT_SURFACE.store(incoming, Ordering::SeqCst);
+            super::jni::sync_appearance(platform);
             win.set_active(true);
             log::info!("gpui-main: first window opened");
             if let Some(launch) = app.launch.take() {
@@ -445,6 +457,12 @@ pub fn ime_event(session: u64, kind: i32, text: String, start: usize, end: usize
         start,
         end,
     });
+}
+
+/// Call from `Activity.onConfigurationChanged`, for an Activity that handles
+/// configuration changes (`uiMode` for night mode) instead of being recreated.
+pub fn configuration_changed() {
+    post(Command::ConfigurationChanged);
 }
 
 pub fn resumed() {
