@@ -250,10 +250,12 @@ fn font_has_cbdt_tables(data: &[u8]) -> bool {
 ///
 /// `path` is relative to the `assets/` directory in the APK (e.g.
 /// `"fonts/NotoColorEmoji.ttf"`).
-fn load_asset_bytes(app: &android_activity::AndroidApp, path: &str) -> anyhow::Result<Vec<u8>> {
+fn load_asset_bytes(
+    asset_manager: &ndk::asset::AssetManager,
+    path: &str,
+) -> anyhow::Result<Vec<u8>> {
     use std::ffi::CString;
 
-    let asset_manager = app.asset_manager();
     let c_path = CString::new(path)?;
 
     // Open the asset.  `AssetManager::open` returns `Option<Asset>`.
@@ -376,8 +378,8 @@ impl AndroidPlatform {
 
             if !emoji_loaded {
                 // Try loading the bundled CBDT NotoColorEmoji from APK assets.
-                if let Some(app) = crate::android::jni::android_app() {
-                    match load_asset_bytes(&app, "fonts/NotoColorEmoji.ttf") {
+                if let Some(assets) = crate::android::jni::asset_manager() {
+                    match load_asset_bytes(&assets, "fonts/NotoColorEmoji.ttf") {
                         Ok(bytes) => {
                             log::info!(
                                 "loaded bundled CBDT emoji font from assets ({} bytes)",
@@ -391,7 +393,7 @@ impl AndroidPlatform {
                         }
                     }
                 } else {
-                    log::debug!("no AndroidApp available — cannot load bundled emoji font");
+                    log::debug!("no AssetManager available — cannot load bundled emoji font");
                 }
             }
 
@@ -1132,7 +1134,11 @@ impl Platform for AndroidPlatform {
     }
 
     fn window_appearance(&self) -> WindowAppearance {
-        WindowAppearance::Dark
+        if crate::android::jni::query_night_mode_via_jni() {
+            WindowAppearance::Dark
+        } else {
+            WindowAppearance::Light
+        }
     }
 
     fn open_url(&self, url: &str) {
