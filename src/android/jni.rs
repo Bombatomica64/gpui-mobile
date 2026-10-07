@@ -314,12 +314,79 @@ pub fn set_host_activity(env: &mut jni::Env<'_>, activity: &JObject<'_>) -> Resu
         vm.get_raw() as *mut c_void,
         std::sync::atomic::Ordering::SeqCst,
     );
+    let assets = host_assets(env, activity);
     let mut slot = HOST_ACTIVITY.lock().expect("poisoned");
     slot.previous = slot.current.take();
     slot.current = Some(global);
     drop(slot);
+    match assets {
+        Ok(assets) => {
+            let mut slot = HOST_ASSETS.lock().expect("poisoned");
+            slot.previous = slot.current.take();
+            slot.current = Some(assets);
+        }
+        Err(err) => log::warn!("set_host_activity: no AssetManager: {err}"),
+    }
     super::accessibility::activity_changed();
     Ok(())
+}
+
+/// The host Activity's `AssetManager`, for what `android-activity` would otherwise
+/// provide: bundled assets and the current `Configuration`. Kept one generation
+/// longer, like [`HOST_ACTIVITY`].
+static HOST_ASSETS: Mutex<HostAssetsSlot> = Mutex::new(HostAssetsSlot {
+    current: None,
+    previous: None,
+});
+
+struct HostAssetsSlot {
+    current: Option<HostAssets>,
+    previous: Option<HostAssets>,
+}
+
+struct HostAssets {
+    /// Keeps the Java `AssetManager` (and so the native one) alive.
+    _java: jni::refs::Global<JObject<'static>>,
+    native: std::ptr::NonNull<ndk_sys::AAssetManager>,
+}
+
+// SAFETY: an `AAssetManager` may be used from any thread, and the global reference
+// keeps it alive for as long as this value exists.
+unsafe impl Send for HostAssets {}
+
+fn host_assets(env: &mut jni::Env<'_>, activity: &JObject<'_>) -> Result<HostAssets, String> {
+    let assets = env
+        .call_method(
+            activity,
+            jni::jni_str!("getAssets"),
+            jni::jni_sig!("()Landroid/content/res/AssetManager;"),
+            &[],
+        )
+        .and_then(|value| value.l())
+        .e()?;
+    let java = env.new_global_ref(&assets).e()?;
+    // SAFETY: `env` is the current thread's JNI env and `assets` a live AssetManager.
+    let native =
+        unsafe { ndk_sys::AAssetManager_fromJava(env.get_raw() as _, assets.as_raw() as _) };
+    let native = std::ptr::NonNull::new(native).ok_or("AAssetManager_fromJava returned null")?;
+    Ok(HostAssets {
+        _java: java,
+        native,
+    })
+}
+
+/// The app's `AssetManager`: from `android-activity`, or from the Activity passed to
+/// [`set_host_activity`] on the host-driven path.
+pub fn asset_manager() -> Option<ndk::asset::AssetManager> {
+    if let Some(app) = android_app() {
+        return Some(app.asset_manager());
+    }
+    let slot = HOST_ASSETS.lock().expect("poisoned");
+    // SAFETY: the pointer stays valid while its `HostAssets` is stored, which is at
+    // least until the Activity after next registers.
+    slot.current
+        .as_ref()
+        .map(|assets| unsafe { ndk::asset::AssetManager::from_ptr(assets.native) })
 }
 
 /// Public accessor for the JavaVM pointer.
@@ -409,17 +476,27 @@ const AMOTION_EVENT_ACTION_CANCEL: u32 = 3;
 ///
 /// Returns `true` if the system is in dark mode.
 pub fn query_night_mode_via_jni() -> bool {
-    let app = match android_app() {
-        Some(app) => app,
-        None => return false,
+    let Some(assets) = asset_manager() else {
+        return false;
     };
 
     // Build an ndk::configuration::Configuration from the app's asset manager.
-    let config = ndk::configuration::Configuration::from_asset_manager(&app.asset_manager());
+    let config = ndk::configuration::Configuration::from_asset_manager(&assets);
     let is_dark = config.ui_mode_night() == ndk::configuration::UiModeNight::Yes;
 
     log::debug!("query_night_mode (ndk): is_dark={}", is_dark);
     is_dark
+}
+
+/// Apply the system night mode to the primary window.
+pub(crate) fn sync_appearance(platform: &AndroidPlatform) {
+    if let Some(win) = platform.primary_window() {
+        win.set_appearance(if query_night_mode_via_jni() {
+            crate::android::window::WindowAppearance::Dark
+        } else {
+            crate::android::window::WindowAppearance::Light
+        });
+    }
 }
 
 // ── input event processing ────────────────────────────────────────────────────
@@ -789,15 +866,7 @@ pub fn run_event_loop(app: &AndroidApp) {
             log::debug!("deferred: ConfigChanged");
             if let Some(platform) = PLATFORM.get() {
                 platform.notify_keyboard_layout_change();
-                let is_dark = query_night_mode_via_jni();
-                if let Some(win) = platform.primary_window() {
-                    let appearance = if is_dark {
-                        crate::android::window::WindowAppearance::Dark
-                    } else {
-                        crate::android::window::WindowAppearance::Light
-                    };
-                    win.set_appearance(appearance);
-                }
+                sync_appearance(platform);
             }
         }
 
