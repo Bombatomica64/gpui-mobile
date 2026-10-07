@@ -1421,8 +1421,8 @@ impl PlatformWindow for AndroidPlatformWindow {
 
             let mut cb = send_callback.lock();
             cb(RequestFrameOptions {
-                require_presentation: false,
                 force_render: text_dirty || surface_new,
+                ..Default::default()
             });
         });
     }
