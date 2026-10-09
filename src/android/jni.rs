@@ -435,8 +435,8 @@ fn is_gone(env: &mut jni::Env<'_>, activity: &JObject<'_>) -> bool {
 /// `android-activity` path. Each Activity is used until it finishes or is destroyed;
 /// with several alive, the most recently registered one is used. A no-op when
 /// `android-activity` owns the process.
-/// Call it before `host::start`: the platform reads bundled assets (the emoji font)
-/// when it starts.
+/// Call it on the UI thread (as `onCreate` is), and before `host::start`: the
+/// platform reads bundled assets (the emoji font) when it starts.
 pub fn set_host_activity(env: &mut jni::Env<'_>, activity: &JObject<'_>) -> Result<(), String> {
     if ANDROID_APP.get().is_some() {
         return Ok(());
@@ -451,6 +451,11 @@ pub fn set_host_activity(env: &mut jni::Env<'_>, activity: &JObject<'_>) -> Resu
     prune_gone_activities(env, &mut activities);
     activities.push(global);
     drop(activities);
+    if UI_THREAD.get().is_none() {
+        if let Err(err) = register_ui_thread() {
+            log::warn!("set_host_activity: cannot post to the UI thread: {err}");
+        }
+    }
     super::accessibility::activity_changed();
     if HOST_APPLICATION.get().is_none() {
         match fetch_application_context(env, activity) {
@@ -636,6 +641,108 @@ const AMOTION_EVENT_ACTION_DOWN: u32 = 0;
 const AMOTION_EVENT_ACTION_UP: u32 = 1;
 const AMOTION_EVENT_ACTION_MOVE: u32 = 2;
 const AMOTION_EVENT_ACTION_CANCEL: u32 = 3;
+
+// ── UI thread ────────────────────────────────────────────────────────────────
+
+/// The Java UI thread's looper, with an eventfd that wakes it to run
+/// [`run_on_ui_thread`] tasks.
+struct UiThread {
+    id: std::thread::ThreadId,
+    wake: std::os::fd::OwnedFd,
+    _looper: ndk::looper::ForeignLooper,
+}
+
+static UI_THREAD: OnceLock<UiThread> = OnceLock::new();
+
+type UiTask = Box<dyn FnOnce(&mut jni::Env<'_>) + Send>;
+
+static UI_TASKS: Mutex<Vec<UiTask>> = Mutex::new(Vec::new());
+
+/// Remember the calling thread, which must be the UI thread, as the one
+/// [`run_on_ui_thread`] posts to.
+fn register_ui_thread() -> Result<(), String> {
+    use std::os::fd::{AsFd, FromRawFd};
+
+    let looper = ndk::looper::ForeignLooper::for_thread().ok_or("this thread has no looper")?;
+    // SAFETY: plain syscall; the descriptor is owned by `wake` from here on.
+    let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+    if fd < 0 {
+        return Err(format!("eventfd: {}", std::io::Error::last_os_error()));
+    }
+    // SAFETY: `fd` is a new descriptor nothing else owns.
+    let wake = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+    looper
+        .add_fd_with_callback(wake.as_fd(), ndk::looper::FdEvent::INPUT, |fd, _| {
+            let mut count = [0u8; 8];
+            // SAFETY: reads 8 bytes into `count`; resets the eventfd counter.
+            unsafe {
+                libc::read(
+                    std::os::fd::AsRawFd::as_raw_fd(&fd),
+                    count.as_mut_ptr().cast(),
+                    8,
+                )
+            };
+            run_ui_tasks();
+            true
+        })
+        .map_err(|err| format!("ALooper_addFd: {err:?}"))?;
+    let _ = UI_THREAD.set(UiThread {
+        id: std::thread::current().id(),
+        wake,
+        _looper: looper,
+    });
+    Ok(())
+}
+
+fn run_ui_tasks() {
+    let tasks = std::mem::take(&mut *UI_TASKS.lock().expect("poisoned"));
+    for task in tasks {
+        // Each in its own frame, so an exception one leaves cannot fail the next.
+        if let Err(err) = with_env(|env| {
+            task(env);
+            Ok(())
+        }) {
+            log::warn!("run_on_ui_thread: {err}");
+        }
+    }
+}
+
+/// Run `f` on the Java UI thread, which Android requires for `View` and `Window`
+/// calls: soon if called from another thread, right away on the UI thread itself.
+///
+/// On the host-driven path the UI thread is the one that called
+/// [`set_host_activity`]. On the `android-activity` path it cannot be reached without
+/// Java code, so `f` runs on the calling thread, as these calls always did there.
+pub fn run_on_ui_thread(f: impl FnOnce(&mut jni::Env<'_>) + Send + 'static) {
+    let Some(ui) = UI_THREAD.get() else {
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            log::debug!("run_on_ui_thread: no UI thread registered; running in place");
+        }
+        let _ = with_env(|env| {
+            f(env);
+            Ok(())
+        });
+        return;
+    };
+    if std::thread::current().id() == ui.id {
+        let _ = with_env(|env| {
+            f(env);
+            Ok(())
+        });
+        return;
+    }
+    UI_TASKS.lock().expect("poisoned").push(Box::new(f));
+    let one = 1u64.to_ne_bytes();
+    // SAFETY: writes 8 bytes from `one` to the eventfd, which wakes the UI looper.
+    unsafe {
+        libc::write(
+            std::os::fd::AsRawFd::as_raw_fd(&ui.wake),
+            one.as_ptr().cast(),
+            8,
+        )
+    };
+}
 
 // ── night mode query ─────────────────────────────────────────────────────────
 
@@ -1418,11 +1525,9 @@ pub fn init_platform(app: &AndroidApp) -> &'static Arc<AndroidPlatform> {
 
 /// Cached last-applied system chrome style.
 ///
-/// `set_system_chrome` is called on every frame render.  The JNI calls it
-/// makes (getWindow, setStatusBarColor, etc.) are View operations that can
-/// contend with the Android UI thread and intermittently deadlock.
-/// By caching the last applied style we skip the JNI calls entirely when
-/// nothing changed — which is the common case.
+/// `set_system_chrome` is called on every frame render. By caching the last
+/// applied style we skip the JNI calls entirely when nothing changed — which is the
+/// common case.
 #[allow(clippy::type_complexity)]
 static LAST_CHROME_STYLE: std::sync::Mutex<
     Option<(Option<u32>, Option<u32>, crate::StatusBarContentStyle)>,
@@ -1431,15 +1536,14 @@ static LAST_CHROME_STYLE: std::sync::Mutex<
 /// Apply system chrome styling on Android.
 ///
 /// Sets the status bar color, navigation bar color, and light/dark
-/// status bar icons via JNI calls to `Window` and `WindowInsetsController`.
-///
-/// Must be called from the main (native) thread that has JNI access.
+/// status bar icons via JNI calls to `Window` and `WindowInsetsController`, which run
+/// on the UI thread (see [`run_on_ui_thread`]).
 pub fn set_system_chrome(style: &crate::SystemChromeStyle) {
     let status_bar_color = style.status_bar_color;
     let navigation_bar_color = style.navigation_bar_color;
     let status_bar_style = style.status_bar_style;
 
-    // Skip the (expensive, potentially deadlocking) JNI calls when nothing changed.
+    // Skip the JNI calls when nothing changed.
     {
         let key = (status_bar_color, navigation_bar_color, status_bar_style);
         let mut last = LAST_CHROME_STYLE.lock().unwrap();
@@ -1449,116 +1553,119 @@ pub fn set_system_chrome(style: &crate::SystemChromeStyle) {
         *last = Some(key);
     }
 
-    let result = with_env(|env| {
-        let activity_obj = activity(env)?;
+    // Window calls belong on the UI thread; from the render thread they could
+    // deadlock against it.
+    run_on_ui_thread(move |env| {
+        let result = (|| -> Result<(), String> {
+            let activity_obj = activity(env)?;
 
-        // 1. Get the Window: activity.getWindow()
-        let window = env
-            .call_method(
-                &activity_obj,
-                jni::jni_str!("getWindow"),
-                jni::jni_sig!("()Landroid/view/Window;"),
-                &[],
-            )
-            .and_then(|v: jni::objects::JValueOwned| v.l())
-            .or_clear(env)?;
-        if window.is_null() {
-            return Err("getWindow returned null".into());
-        }
-
-        // 2. Set status bar color if provided
-        if let Some(color) = status_bar_color {
-            let argb = (0xFF000000_u32 | color) as i32;
-            let _ = env.call_method(
-                &window,
-                jni::jni_str!("setStatusBarColor"),
-                jni::jni_sig!("(I)V"),
-                &[JValue::Int(argb)],
-            );
-            env.exception_clear();
-        }
-
-        // 3. Set navigation bar color if provided
-        if let Some(color) = navigation_bar_color {
-            let argb = (0xFF000000_u32 | color) as i32;
-            let _ = env.call_method(
-                &window,
-                jni::jni_str!("setNavigationBarColor"),
-                jni::jni_sig!("(I)V"),
-                &[JValue::Int(argb)],
-            );
-            env.exception_clear();
-        }
-
-        // 4. Set light/dark status bar icons via WindowInsetsController (API 30+)
-        let insetsctl = env.call_method(
-            &window,
-            jni::jni_str!("getInsetsController"),
-            jni::jni_sig!("()Landroid/view/WindowInsetsController;"),
-            &[],
-        );
-
-        if let Ok(v) = insetsctl {
-            if let Ok(ctl) = v.l() {
-                if !ctl.is_null() {
-                    let mask: i32 = 0x00000008;
-                    let appearance: i32 = match status_bar_style {
-                        crate::StatusBarContentStyle::Dark => 0x00000008,
-                        crate::StatusBarContentStyle::Light => 0,
-                    };
-                    let _ = env.call_method(
-                        &ctl,
-                        jni::jni_str!("setSystemBarsAppearance"),
-                        jni::jni_sig!("(II)V"),
-                        &[JValue::Int(appearance), JValue::Int(mask)],
-                    );
-                    env.exception_clear();
-                }
-            }
-        } else {
-            env.exception_clear();
-
-            if let Ok(decor) = env
+            // 1. Get the Window: activity.getWindow()
+            let window = env
                 .call_method(
-                    &window,
-                    jni::jni_str!("getDecorView"),
-                    jni::jni_sig!("()Landroid/view/View;"),
+                    &activity_obj,
+                    jni::jni_str!("getWindow"),
+                    jni::jni_sig!("()Landroid/view/Window;"),
                     &[],
                 )
                 .and_then(|v: jni::objects::JValueOwned| v.l())
-            {
-                if !decor.is_null() {
-                    if let Ok(current) = env
-                        .call_method(
-                            &decor,
-                            jni::jni_str!("getSystemUiVisibility"),
-                            jni::jni_sig!("()I"),
-                            &[],
-                        )
-                        .and_then(|v: jni::objects::JValueOwned| v.i())
-                    {
-                        let new_flags = match status_bar_style {
-                            crate::StatusBarContentStyle::Dark => current | 0x00002000,
-                            crate::StatusBarContentStyle::Light => current & !0x00002000,
+                .or_clear(env)?;
+            if window.is_null() {
+                return Err("getWindow returned null".into());
+            }
+
+            // 2. Set status bar color if provided
+            if let Some(color) = status_bar_color {
+                let argb = (0xFF000000_u32 | color) as i32;
+                let _ = env.call_method(
+                    &window,
+                    jni::jni_str!("setStatusBarColor"),
+                    jni::jni_sig!("(I)V"),
+                    &[JValue::Int(argb)],
+                );
+                env.exception_clear();
+            }
+
+            // 3. Set navigation bar color if provided
+            if let Some(color) = navigation_bar_color {
+                let argb = (0xFF000000_u32 | color) as i32;
+                let _ = env.call_method(
+                    &window,
+                    jni::jni_str!("setNavigationBarColor"),
+                    jni::jni_sig!("(I)V"),
+                    &[JValue::Int(argb)],
+                );
+                env.exception_clear();
+            }
+
+            // 4. Set light/dark status bar icons via WindowInsetsController (API 30+)
+            let insetsctl = env.call_method(
+                &window,
+                jni::jni_str!("getInsetsController"),
+                jni::jni_sig!("()Landroid/view/WindowInsetsController;"),
+                &[],
+            );
+
+            if let Ok(v) = insetsctl {
+                if let Ok(ctl) = v.l() {
+                    if !ctl.is_null() {
+                        let mask: i32 = 0x00000008;
+                        let appearance: i32 = match status_bar_style {
+                            crate::StatusBarContentStyle::Dark => 0x00000008,
+                            crate::StatusBarContentStyle::Light => 0,
                         };
                         let _ = env.call_method(
-                            &decor,
-                            jni::jni_str!("setSystemUiVisibility"),
-                            jni::jni_sig!("(I)V"),
-                            &[JValue::Int(new_flags)],
+                            &ctl,
+                            jni::jni_str!("setSystemBarsAppearance"),
+                            jni::jni_sig!("(II)V"),
+                            &[JValue::Int(appearance), JValue::Int(mask)],
                         );
                         env.exception_clear();
                     }
                 }
+            } else {
+                env.exception_clear();
+
+                if let Ok(decor) = env
+                    .call_method(
+                        &window,
+                        jni::jni_str!("getDecorView"),
+                        jni::jni_sig!("()Landroid/view/View;"),
+                        &[],
+                    )
+                    .and_then(|v: jni::objects::JValueOwned| v.l())
+                {
+                    if !decor.is_null() {
+                        if let Ok(current) = env
+                            .call_method(
+                                &decor,
+                                jni::jni_str!("getSystemUiVisibility"),
+                                jni::jni_sig!("()I"),
+                                &[],
+                            )
+                            .and_then(|v: jni::objects::JValueOwned| v.i())
+                        {
+                            let new_flags = match status_bar_style {
+                                crate::StatusBarContentStyle::Dark => current | 0x00002000,
+                                crate::StatusBarContentStyle::Light => current & !0x00002000,
+                            };
+                            let _ = env.call_method(
+                                &decor,
+                                jni::jni_str!("setSystemUiVisibility"),
+                                jni::jni_sig!("(I)V"),
+                                &[JValue::Int(new_flags)],
+                            );
+                            env.exception_clear();
+                        }
+                    }
+                }
             }
+
+            Ok(())
+        })();
+        if let Err(e) = result {
+            log::warn!("set_system_chrome: {e}");
         }
-
-        Ok(())
     });
-
-    if let Err(e) = result {
-        log::warn!("set_system_chrome: {e}");
-    }
 
     log::info!(
         "set_system_chrome: status_bar_color={:?}, nav_bar_color={:?}, style={:?}",
