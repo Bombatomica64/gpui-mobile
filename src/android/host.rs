@@ -43,7 +43,10 @@
 //!
 //! The Activity must also expose the Java methods `jni.rs` calls back into for the IME
 //! (`gpuiShowKeyboard`, `gpuiHideKeyboard`, `gpuiResetComposition`); `GpuiInputActivity`
-//! in the example project is the reference implementation.
+//! in the example project is the reference implementation. A host that also has
+//! `gpuiShowKeyboardWithInputType(int inputType, int imeOptions, long session)` gets
+//! the focused field's `EditorInfo` values (from GPUI's `TextInputConfiguration`) to
+//! apply to its proxy, instead of a bare keyboard type.
 //!
 //! # Threading contract
 //!
@@ -670,7 +673,11 @@ pub fn key(key_code: i32, action: i32, meta_state: i32) {
 /// here. Safe to call from the Java UI thread — the event is queued, not applied.
 ///
 /// `kind` matches the Java side: `0` composing, `1` commit, `2` delete-surrounding,
-/// `3` delete-in-code-points, `4` done/dismiss.
+/// `3` delete-in-code-points, `4` done/dismiss, `5` keyboard hidden by back, `6` the
+/// keyboard's action key (`performEditorAction`) with the `IME_ACTION_*` in `start`.
+/// Send `6` for every action of a field shown through `gpuiShowKeyboardWithInputType`:
+/// the field gets it as its enter key, and Done, Go, Search and Send then hide the
+/// keyboard.
 pub fn ime_event(session: u64, kind: i32, text: String, start: usize, end: usize) {
     super::text_input::enqueue(super::text_input::ImeEvent {
         session,

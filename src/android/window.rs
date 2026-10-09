@@ -1569,6 +1569,11 @@ impl PlatformWindow for AndroidPlatformWindow {
         }
     }
 
+    fn set_text_input_configuration(&mut self, configuration: gpui::TextInputConfiguration) {
+        let has_input = self.input_handler.borrow().is_some();
+        super::jni::set_text_input_configuration(configuration, has_input);
+    }
+
     fn show_soft_keyboard(&self) {
         super::jni::show_keyboard_android(crate::KeyboardType::Default);
     }
@@ -1636,9 +1641,12 @@ impl PlatformWindow for AndroidPlatformWindow {
 
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
         let input_handler = Rc::clone(&self.input_handler);
+        let ime_input_callback = Arc::clone(&self.ime_input_callback);
         let mut callback = callback;
         let callback: Box<dyn FnMut(RequestFrameOptions)> = Box::new(move |options| {
-            super::text_input::drain(&input_handler);
+            super::text_input::drain(&input_handler, |input| {
+                (ime_input_callback.lock())(input);
+            });
             callback(options);
         });
         // PlatformWindow gives us Box<dyn FnMut(...)> (not Send).
@@ -1679,7 +1687,9 @@ impl PlatformWindow for AndroidPlatformWindow {
                         gpui::TouchPhase::Started => {
                             // Apply any last IME update to the old input before a tap can
                             // change focus. A new native session rejects late IME callbacks.
-                            super::text_input::drain(&input_handler);
+                            super::text_input::drain(&input_handler, |input| {
+                                callback(input);
+                            });
                             super::text_input::finish_composition(&input_handler);
                             tap_start = Some((touch.id, touch.position));
                         }

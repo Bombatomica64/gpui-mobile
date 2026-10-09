@@ -155,6 +155,7 @@ pub mod display;
 mod document_picker;
 pub(crate) mod frame_source;
 pub mod host;
+mod input_type;
 pub mod jni;
 pub mod keyboard;
 pub mod platform;
