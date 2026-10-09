@@ -155,13 +155,16 @@ pub fn activity<'local>(env: &mut jni::Env<'local>) -> Result<JObject<'local>, S
         return env.new_local_ref(&global).e();
     }
     let mut activities = HOST_ACTIVITIES.lock().expect("poisoned");
-    // Deleting a global reference is safe while the lock is held: nothing hands out
-    // their raw pointers outside it (except the documented `activity_as_ptr`).
-    prune_gone_activities(env, &mut activities);
-    match activities.last() {
-        Some(activity) => env.new_local_ref(activity).e(),
-        None => Err("Activity not available".into()),
+    // Only the newest is checked, so the common case costs two calls; older ones are
+    // pruned when the next Activity registers. Deleting a global reference is safe
+    // while the lock is held: only the deprecated `activity_as_ptr` hands out raw ones.
+    while let Some(newest) = activities.last() {
+        if !is_gone(env, newest) {
+            return env.new_local_ref(newest).e();
+        }
+        activities.pop();
     }
+    Err("Activity not available".into())
 }
 
 /// The application context, as a local reference in `env`'s frame. Unlike an
@@ -475,6 +478,8 @@ pub fn set_host_activity(env: &mut jni::Env<'_>, activity: &JObject<'_>) -> Resu
     prune_gone_activities(env, &mut activities);
     activities.push(global);
     drop(activities);
+    // A new Activity has a new Window: apply the system chrome to it again.
+    *LAST_CHROME_STYLE.lock().expect("poisoned") = None;
     if UI_THREAD.get().is_none() {
         if let Err(err) = register_ui_thread() {
             log::warn!("set_host_activity: cannot post to the UI thread: {err}");
@@ -596,6 +601,7 @@ pub fn java_vm() -> *mut c_void {
 /// On the host-driven path the reference is deleted once its Activity finishes and a
 /// later [`activity`] or [`set_host_activity`] call notices, so it must not be kept.
 /// Prefer [`activity`], which returns a local reference.
+#[deprecated(note = "the reference may be deleted while in use; use `activity(env)`")]
 pub fn activity_as_ptr() -> *mut c_void {
     ANDROID_APP
         .get()
@@ -670,7 +676,8 @@ static UI_THREAD: OnceLock<UiThread> = OnceLock::new();
 
 type UiTask = Box<dyn FnOnce(&mut jni::Env<'_>) + Send>;
 
-static UI_TASKS: Mutex<Vec<UiTask>> = Mutex::new(Vec::new());
+/// Pending tasks, with the key of those posted by [`run_latest_on_ui_thread`].
+static UI_TASKS: Mutex<Vec<(Option<&'static str>, UiTask)>> = Mutex::new(Vec::new());
 
 /// Remember the calling thread, which must be the UI thread, as the one
 /// [`run_on_ui_thread`] posts to.
@@ -710,14 +717,18 @@ fn register_ui_thread() -> Result<(), String> {
 
 fn run_ui_tasks() {
     let tasks = std::mem::take(&mut *UI_TASKS.lock().expect("poisoned"));
-    for task in tasks {
-        // Each in its own frame, so an exception one leaves cannot fail the next.
-        if let Err(err) = with_env(|env| {
-            task(env);
-            Ok(())
-        }) {
-            log::warn!("run_on_ui_thread: {err}");
-        }
+    for (_, task) in tasks {
+        run_ui_task(task);
+    }
+}
+
+/// Run a task in its own frame, so an exception it leaves cannot fail the next.
+fn run_ui_task(task: UiTask) {
+    if let Err(err) = with_env(|env| {
+        task(env);
+        Ok(())
+    }) {
+        log::warn!("run_on_ui_thread: {err}");
     }
 }
 
@@ -728,25 +739,38 @@ fn run_ui_tasks() {
 /// [`set_host_activity`]. On the `android-activity` path it cannot be reached without
 /// Java code, so `f` runs on the calling thread, as these calls always did there.
 pub fn run_on_ui_thread(f: impl FnOnce(&mut jni::Env<'_>) + Send + 'static) {
+    post_to_ui_thread(None, Box::new(f));
+}
+
+/// Like [`run_on_ui_thread`], but a task posted with the same `key` that has not run
+/// yet is dropped: for updates where only the latest matters (the IME cursor
+/// position, the system chrome), so they cannot pile up behind a busy UI thread.
+pub(crate) fn run_latest_on_ui_thread(
+    key: &'static str,
+    f: impl FnOnce(&mut jni::Env<'_>) + Send + 'static,
+) {
+    post_to_ui_thread(Some(key), Box::new(f));
+}
+
+fn post_to_ui_thread(key: Option<&'static str>, task: UiTask) {
     let Some(ui) = UI_THREAD.get() else {
         static WARNED: AtomicBool = AtomicBool::new(false);
         if !WARNED.swap(true, Ordering::Relaxed) {
             log::debug!("run_on_ui_thread: no UI thread registered; running in place");
         }
-        let _ = with_env(|env| {
-            f(env);
-            Ok(())
-        });
+        run_ui_task(task);
         return;
     };
     if std::thread::current().id() == ui.id {
-        let _ = with_env(|env| {
-            f(env);
-            Ok(())
-        });
+        run_ui_task(task);
         return;
     }
-    UI_TASKS.lock().expect("poisoned").push(Box::new(f));
+    let mut tasks = UI_TASKS.lock().expect("poisoned");
+    if key.is_some() {
+        tasks.retain(|(pending, _)| *pending != key);
+    }
+    tasks.push((key, task));
+    drop(tasks);
     let one = 1u64.to_ne_bytes();
     // SAFETY: writes 8 bytes from `one` to the eventfd, which wakes the UI looper.
     unsafe {
@@ -1572,7 +1596,7 @@ pub fn set_system_chrome(style: &crate::SystemChromeStyle) {
 
     // Window calls belong on the UI thread; from the render thread they could
     // deadlock against it.
-    run_on_ui_thread(move |env| {
+    run_latest_on_ui_thread("system_chrome", move |env| {
         let result = (|| -> Result<(), String> {
             let activity_obj = activity(env)?;
 
@@ -1999,6 +2023,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn activity_as_ptr_returns_null_before_init() {
         let ptr = activity_as_ptr();
         assert!(ptr.is_null());

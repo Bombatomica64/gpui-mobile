@@ -1964,7 +1964,7 @@ impl PlatformWindow for AndroidPlatformWindow {
         let h: f32 = bounds.size.height.into();
 
         // `updateCursorAnchorInfo` takes a View, so it runs on the UI thread.
-        jni_helpers::run_on_ui_thread(move |env| {
+        jni_helpers::run_latest_on_ui_thread("ime_position", move |env| {
             let result = (|| -> Result<(), String> {
                 let activity = jni_helpers::activity(env)?;
 
