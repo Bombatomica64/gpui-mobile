@@ -109,6 +109,7 @@ pub(super) fn update(callbacks: &Handlers, tree: TreeUpdate) {
     };
     if adapter.is_accessibility_enabled() {
         adapter.inner.update_if_active(|| tree);
+        adapter.clear_exception();
         return;
     }
     // The screen reader has gone. Stop GPUI building trees, and swap in an adapter
@@ -144,16 +145,39 @@ impl Bridge {
 }
 
 impl Adapter {
+    /// Raising events calls into Java; don't leave its exception to the next caller.
+    fn clear_exception(&self) {
+        if let Ok(mut env) = self.vm.get_env() {
+            let _ = clear_exception(&mut env, Ok(()));
+        }
+    }
+
     fn is_accessibility_enabled(&self) -> bool {
-        let enabled = self
-            .vm
-            .get_env()
-            .and_then(|mut env| env.call_method(&self.manager, "isEnabled", "()Z", &[])?.z());
+        let enabled = self.vm.get_env().and_then(|mut env| {
+            let enabled = env
+                .call_method(&self.manager, "isEnabled", "()Z", &[])
+                .and_then(|value| value.z());
+            clear_exception(&mut env, enabled)
+        });
         enabled.unwrap_or_else(|err| {
             log::warn!("accessibility: AccessibilityManager.isEnabled failed: {err}");
             false
         })
     }
+}
+
+/// `accesskit_android`'s jni 0.21 returns an error for a Java exception but leaves it
+/// pending, and no further JNI call is allowed until it is cleared. Clear it (after
+/// logging it) so it does not surface in the next, unrelated call on this thread.
+fn clear_exception<T>(
+    env: &mut JNIEnv,
+    result: accesskit_android::jni::errors::Result<T>,
+) -> accesskit_android::jni::errors::Result<T> {
+    if env.exception_check().unwrap_or(false) {
+        let _ = env.exception_describe();
+        let _ = env.exception_clear();
+    }
+    result
 }
 
 fn accessibility_manager(
@@ -203,7 +227,7 @@ fn with_host_view_of<T>(
     let mut env = vm
         .attach_current_thread_permanently()
         .map_err(|e| e.to_string())?;
-    env.with_local_frame(8, |env| {
+    let result = env.with_local_frame(8, |env| {
         let window = env
             .call_method(&activity, "getWindow", "()Landroid/view/Window;", &[])?
             .l()?;
@@ -224,6 +248,6 @@ fn with_host_view_of<T>(
             return Ok(Err("the Activity has no content view".into()));
         }
         Ok::<_, accesskit_android::jni::errors::Error>(Ok(f(env, &view)?))
-    })
-    .map_err(|e| e.to_string())?
+    });
+    clear_exception(&mut env, result).map_err(|e| e.to_string())?
 }
