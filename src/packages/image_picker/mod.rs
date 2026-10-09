@@ -6,6 +6,10 @@
 //!
 //! Inspired by [image_picker](https://pub.dev/packages/image_picker).
 //!
+//! On Android, the calls that show a picker block until the user is done, and
+//! return an error on GPUI's thread or the UI thread: call them from a background
+//! thread, e.g. `cx.background_spawn(async move { ... })`.
+//!
 //! Feature-gated behind `image_picker`.
 
 #[cfg(target_os = "android")]

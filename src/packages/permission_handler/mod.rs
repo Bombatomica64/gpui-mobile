@@ -8,6 +8,10 @@
 //!
 //! Inspired by [permission_handler](https://pub.dev/packages/permission_handler).
 //!
+//! On Android, the calls that show a dialog block until the user is done, and
+//! return an error on GPUI's thread or the UI thread: call them from a background
+//! thread, e.g. `cx.background_spawn(async move { ... })`.
+//!
 //! Feature-gated behind `permission_handler`.
 
 #[cfg(target_os = "android")]

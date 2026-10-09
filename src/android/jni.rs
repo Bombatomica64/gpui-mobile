@@ -140,6 +140,22 @@ pub fn obtain_env<T>(f: impl FnOnce(&mut jni::Env) -> Result<T, String>) -> Resu
     with_env(f)
 }
 
+/// Fail unless the calling thread may wait for the user.
+///
+/// Calls that show another Activity (a picker, a permission dialog, a biometric
+/// prompt) block until the user answers. A thread with a looper must not wait that
+/// long: on GPUI's thread the app stops drawing (and on the `android-activity` path the
+/// pause handshake deadlocks), and the Java UI thread is the one that delivers the
+/// answer. Call them from a background thread, e.g. GPUI's `background_spawn`.
+pub(crate) fn ensure_may_wait_for_user(what: &str) -> Result<(), String> {
+    if ndk::looper::ForeignLooper::for_thread().is_some() {
+        return Err(format!(
+            "{what} waits for the user: call it from a background thread, not GPUI's or the UI thread"
+        ));
+    }
+    Ok(())
+}
+
 /// The current Activity, as a local reference in `env`'s frame.
 ///
 /// On the host-driven path this is the most recently registered Activity that is

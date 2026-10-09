@@ -62,6 +62,11 @@ pub fn request_permission(permission: Permission) -> Result<PermissionStatus, St
     if perm_string.is_empty() {
         return Ok(PermissionStatus::Granted);
     }
+    // Only a dialog waits for the user.
+    if check_permission(permission)? == PermissionStatus::Granted {
+        return Ok(PermissionStatus::Granted);
+    }
+    jni_helpers::ensure_may_wait_for_user("permission_handler::request_permission")?;
 
     jni_helpers::with_env(|env| {
         let activity = jni_helpers::activity(env)?;
@@ -85,6 +90,15 @@ pub fn request_permission(permission: Permission) -> Result<PermissionStatus, St
 pub fn request_permissions(
     permissions: &[Permission],
 ) -> Result<Vec<(Permission, PermissionStatus)>, String> {
+    // Only a dialog waits for the user.
+    let statuses = permissions
+        .iter()
+        .map(|&p| check_permission(p).map(|status| (p, status)))
+        .collect::<Result<Vec<_>, _>>()?;
+    if statuses.iter().all(|(_, status)| *status == PermissionStatus::Granted) {
+        return Ok(statuses);
+    }
+    jni_helpers::ensure_may_wait_for_user("permission_handler::request_permissions")?;
     jni_helpers::with_env(|env| {
         let activity = jni_helpers::activity(env)?;
         let cls = jni_helpers::find_app_class(env, HELPER_CLASS)?;

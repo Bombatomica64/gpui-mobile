@@ -4,7 +4,6 @@ import android.app.Activity;
 import android.os.Bundle;
 
 import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.atomic.AtomicIntegerArray;
 
 /**
  * Transparent helper Activity for handling runtime permission requests.
@@ -21,33 +20,72 @@ public class GpuiPermissionActivity extends Activity {
     private static final int PERMISSION_REQUEST_CODE = 9002;
     private static final String KEY_WAITING = "gpui_waiting_for_permission";
 
-    /** Latch that the calling thread waits on. */
-    static CountDownLatch sLatch;
-    /** Permissions to request. */
-    static String[] sPermissions;
-    /** Grant results (PackageManager.PERMISSION_GRANTED or DENIED). */
-    static AtomicIntegerArray sResults;
+    /** One permission request, and the grant results the calling thread waits for. */
+    static final class Request {
+        final String[] permissions;
+        final CountDownLatch done = new CountDownLatch(1);
+        /** Null, or shorter than {@code permissions}, if the request was interrupted. */
+        int[] grantResults;
+
+        Request(String[] permissions) { this.permissions = permissions; }
+
+        synchronized void complete(int[] grantResults) {
+            if (done.getCount() == 0) return;
+            this.grantResults = grantResults;
+            done.countDown();
+        }
+    }
+
+    /** The request being shown; one at a time. */
+    private static Request sPending;
+
+    private Request mRequest;
 
     /** Whether we are waiting for a permission result. */
     private boolean mWaitingForResult = false;
 
+    /**
+     * Request {@code permissions} and wait for the user's answer.
+     *
+     * <p>Blocks the calling thread, which must not be the UI thread, until the
+     * dialog is answered or this Activity goes away.</p>
+     *
+     * @return the grant results; null or short if the request was interrupted.
+     */
+    static int[] request(Activity activity, String[] permissions) throws InterruptedException {
+        Request request = new Request(permissions);
+        synchronized (GpuiPermissionActivity.class) {
+            if (sPending != null) throw new IllegalStateException("A permission request is already open");
+            sPending = request;
+        }
+        try {
+            activity.startActivity(new android.content.Intent(activity, GpuiPermissionActivity.class));
+            request.done.await();
+            return request.grantResults;
+        } finally {
+            synchronized (GpuiPermissionActivity.class) {
+                if (sPending == request) sPending = null;
+            }
+        }
+    }
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        synchronized (GpuiPermissionActivity.class) { mRequest = sPending; }
 
         if (savedInstanceState != null && savedInstanceState.getBoolean(KEY_WAITING, false)) {
-            // Process was killed while permission dialog was showing.
+            // Recreated while the permission dialog was showing.
             // The system will re-deliver the result via onRequestPermissionsResult.
-            android.util.Log.i("GpuiPermission", "Recreated after process death, waiting for result");
+            android.util.Log.i("GpuiPermission", "Recreated, waiting for result");
             mWaitingForResult = true;
             return;
         }
 
-        if (sPermissions != null && sPermissions.length > 0) {
+        if (mRequest != null && mRequest.permissions.length > 0) {
             mWaitingForResult = true;
-            requestPermissions(sPermissions, PERMISSION_REQUEST_CODE);
+            requestPermissions(mRequest.permissions, PERMISSION_REQUEST_CODE);
         } else {
-            deliverResult();
             finish();
         }
     }
@@ -62,30 +100,16 @@ public class GpuiPermissionActivity extends Activity {
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
         mWaitingForResult = false;
-
-        if (requestCode == PERMISSION_REQUEST_CODE && sResults != null) {
-            for (int i = 0; i < grantResults.length && i < sResults.length(); i++) {
-                sResults.set(i, grantResults[i]);
-            }
+        if (requestCode == PERMISSION_REQUEST_CODE && mRequest != null) {
+            mRequest.complete(grantResults);
         }
-
-        deliverResult();
         finish();
     }
 
     @Override
-    public void onBackPressed() {
-        mWaitingForResult = false;
-        deliverResult();
-        super.onBackPressed();
-    }
-
-    private void deliverResult() {
-        if (sLatch != null) {
-            sLatch.countDown();
-        } else {
-            // Process death recovery — latch is gone. Just finish gracefully.
-            android.util.Log.i("GpuiPermission", "No latch (process death recovery), finishing");
-        }
+    protected void onDestroy() {
+        // Gone without an answer, e.g. the task brought to front from the launcher.
+        if (isFinishing() && mRequest != null) mRequest.complete(null);
+        super.onDestroy();
     }
 }

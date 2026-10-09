@@ -11,15 +11,13 @@ import android.net.Uri;
 import android.os.Build;
 import android.provider.Settings;
 
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.atomic.AtomicIntegerArray;
-import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Permission handling helper for the GPUI permission_handler package.
  *
- * <p>Uses a transparent GpuiPickerActivity to handle the permission request
- * callback, since NativeActivity doesn't support onRequestPermissionsResult.</p>
+ * <p>Uses a transparent GpuiPermissionActivity to handle the permission request
+ * callback, since NativeActivity doesn't support onRequestPermissionsResult.
+ * Requests block the calling thread, which must not be the UI thread.</p>
  */
 public final class GpuiPermissions {
 
@@ -28,14 +26,6 @@ public final class GpuiPermissions {
     private static final int STATUS_DENIED = 1;
     private static final int STATUS_PERMANENTLY_DENIED = 2;
     private static final int STATUS_RESTRICTED = 3;
-
-    private static final int REQUEST_CODE = 9002;
-
-    // ── Pending permission request state ─────────────────────────────
-
-    static CountDownLatch sPermLatch;
-    static AtomicIntegerArray sPermResults;
-    static String[] sPendingPermissions;
 
     /**
      * Check a single permission.
@@ -69,7 +59,7 @@ public final class GpuiPermissions {
      *
      * @return 0=granted, 1=denied, 2=permanently_denied
      */
-    public static int requestPermission(Activity activity, String permission) {
+    public static int requestPermission(Activity activity, String permission) throws InterruptedException {
         if (permission == null || permission.isEmpty()) return STATUS_GRANTED;
 
         // Check if already granted
@@ -97,7 +87,7 @@ public final class GpuiPermissions {
      * @param permissions Pipe-separated permission strings.
      * @return Pipe-separated status ints.
      */
-    public static String requestPermissions(Activity activity, String permissions) {
+    public static String requestPermissions(Activity activity, String permissions) throws InterruptedException {
         if (permissions == null || permissions.isEmpty()) return "";
 
         String[] perms = permissions.split("\\|");
@@ -159,7 +149,7 @@ public final class GpuiPermissions {
 
     // ── Internal: request via helper Activity ────────────────────────
 
-    private static int[] requestViaActivity(Activity activity, String[] permissions) {
+    private static int[] requestViaActivity(Activity activity, String[] permissions) throws InterruptedException {
         int[] results = new int[permissions.length];
 
         // Check which permissions are already granted
@@ -187,30 +177,15 @@ public final class GpuiPermissions {
 
         String[] neededArray = needed.toArray(new String[0]);
 
-        // Use GpuiPermissionActivity for the request
-        CountDownLatch latch = new CountDownLatch(1);
-        GpuiPermissionActivity.sLatch = latch;
-        GpuiPermissionActivity.sPermissions = neededArray;
-        GpuiPermissionActivity.sResults = new AtomicIntegerArray(neededArray.length);
-        for (int i = 0; i < neededArray.length; i++) {
-            GpuiPermissionActivity.sResults.set(i, STATUS_DENIED);
-        }
-
-        Intent intent = new Intent(activity, GpuiPermissionActivity.class);
-        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-        activity.startActivity(intent);
-
-        try {
-            latch.await();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
+        int[] grants = GpuiPermissionActivity.request(activity, neededArray);
 
         // Map results back
         for (int i = 0; i < neededIndices.size(); i++) {
             int idx = neededIndices.get(i);
-            int grantResult = GpuiPermissionActivity.sResults.get(i);
-            if (grantResult == PackageManager.PERMISSION_GRANTED) {
+            if (grants == null || i >= grants.length) {
+                // Interrupted before the user answered: nothing was decided.
+                results[idx] = STATUS_DENIED;
+            } else if (grants[i] == PackageManager.PERMISSION_GRANTED) {
                 results[idx] = STATUS_GRANTED;
             } else {
                 // Check if permanently denied (shouldShowRequestPermissionRationale returns false after denial)

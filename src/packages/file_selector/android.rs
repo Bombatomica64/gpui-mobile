@@ -5,6 +5,7 @@ use jni::objects::{JObject, JValue};
 const HELPER_CLASS: &str = "dev.gpui.mobile.GpuiFilePicker";
 
 pub fn open_file(options: &OpenFileOptions) -> Result<Option<SelectedFile>, String> {
+    jni_helpers::ensure_may_wait_for_user("file_selector::open_file")?;
     let mime_types = build_mime_string(options);
     jni_helpers::with_env(|env| {
         let activity = jni_helpers::activity(env)?;
@@ -33,6 +34,7 @@ pub fn open_file(options: &OpenFileOptions) -> Result<Option<SelectedFile>, Stri
 }
 
 pub fn open_files(options: &OpenFileOptions) -> Result<Vec<SelectedFile>, String> {
+    jni_helpers::ensure_may_wait_for_user("file_selector::open_files")?;
     let mime_types = build_mime_string(options);
     jni_helpers::with_env(|env| {
         let activity = jni_helpers::activity(env)?;
@@ -68,6 +70,7 @@ pub fn open_files(options: &OpenFileOptions) -> Result<Vec<SelectedFile>, String
 }
 
 pub fn get_save_path(options: &SaveFileOptions) -> Result<Option<String>, String> {
+    jni_helpers::ensure_may_wait_for_user("file_selector::get_save_path")?;
     jni_helpers::with_env(|env| {
         let activity = jni_helpers::activity(env)?;
         let cls = jni_helpers::find_app_class(env, HELPER_CLASS)?;
@@ -101,6 +104,7 @@ pub fn get_save_path(options: &SaveFileOptions) -> Result<Option<String>, String
 }
 
 pub fn get_directory_path(_initial_directory: Option<&str>) -> Result<Option<String>, String> {
+    jni_helpers::ensure_may_wait_for_user("file_selector::get_directory_path")?;
     jni_helpers::with_env(|env| {
         let activity = jni_helpers::activity(env)?;
         let cls = jni_helpers::find_app_class(env, HELPER_CLASS)?;
