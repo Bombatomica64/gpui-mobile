@@ -66,7 +66,8 @@ impl Default for ImagePickerOptions {
 /// A file picked by the user.
 #[derive(Debug, Clone)]
 pub struct PickedFile {
-    /// Absolute file path (or content URI on Android).
+    /// Absolute file path. On Android, a copy in the app's cache directory, which the
+    /// app may delete once done with it.
     pub path: String,
     /// Display name of the file.
     pub name: String,

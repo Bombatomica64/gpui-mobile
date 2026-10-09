@@ -56,7 +56,8 @@ pub struct SaveFileOptions {
 /// A file selected by the user.
 #[derive(Debug, Clone)]
 pub struct SelectedFile {
-    /// Absolute path or content URI of the file.
+    /// Absolute path of the file. On Android, a copy in the app's cache directory,
+    /// which the app may delete once done with it.
     pub path: String,
     /// Display name of the file.
     pub name: String,
@@ -102,6 +103,9 @@ pub fn open_files(options: &OpenFileOptions) -> Result<Vec<SelectedFile>, String
 
 /// Open a save dialog to get a file path from the user.
 ///
+/// On Android this is a `content://` document URI, not a filesystem path: write to
+/// it through the `ContentResolver`.
+///
 /// Returns `Ok(None)` if the user cancelled.
 pub fn get_save_path(options: &SaveFileOptions) -> Result<Option<String>, String> {
     #[cfg(target_os = "ios")]
@@ -120,6 +124,8 @@ pub fn get_save_path(options: &SaveFileOptions) -> Result<Option<String>, String
 }
 
 /// Open a directory picker.
+///
+/// On Android this is a `content://` tree URI, not a filesystem path.
 ///
 /// Returns `Ok(None)` if the user cancelled.
 pub fn get_directory_path(initial_directory: Option<&str>) -> Result<Option<String>, String> {

@@ -141,6 +141,19 @@
             android:theme="@android:style/Theme.Translucent.NoTitleBar"
         />
 
+        <!-- Lets the camera app write the photo image_picker asked for. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.gpui.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true"
+        >
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/gpui_file_paths"
+            />
+        </provider>
+
         <!-- Transparent helper Activity for runtime permission requests. -->
         <activity
             android:name="dev.gpui.mobile.GpuiPermissionActivity"

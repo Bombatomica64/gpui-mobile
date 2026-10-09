@@ -23,11 +23,14 @@ pub fn pick_image(options: &ImagePickerOptions) -> Result<Option<PickedFile>, St
             .call_static_method(
                 &cls,
                 jni::jni_str!("pickImage"),
-                jni::jni_sig!("(Landroid/app/Activity;II)Ljava/lang/String;"),
+                jni::jni_sig!("(Landroid/app/Activity;IIIII)Ljava/lang/String;"),
                 &[
                     JValue::Object(&activity),
                     JValue::Int(source),
                     JValue::Int(camera_facing),
+                    JValue::Int(dimension(options.max_width)),
+                    JValue::Int(dimension(options.max_height)),
+                    JValue::Int(options.image_quality.unwrap_or(0).into()),
                 ],
             )
             .and_then(|v| v.l())
@@ -44,9 +47,9 @@ pub fn pick_image(options: &ImagePickerOptions) -> Result<Option<PickedFile>, St
 }
 
 pub fn pick_multi_image(
-    _max_width: Option<f64>,
-    _max_height: Option<f64>,
-    _image_quality: Option<u8>,
+    max_width: Option<f64>,
+    max_height: Option<f64>,
+    image_quality: Option<u8>,
 ) -> Result<Vec<PickedFile>, String> {
     jni_helpers::ensure_may_wait_for_user("image_picker::pick_multi_image")?;
     jni_helpers::with_env(|env| {
@@ -57,8 +60,13 @@ pub fn pick_multi_image(
             .call_static_method(
                 &cls,
                 jni::jni_str!("pickMultiImage"),
-                jni::jni_sig!("(Landroid/app/Activity;)[Ljava/lang/String;"),
-                &[JValue::Object(&activity)],
+                jni::jni_sig!("(Landroid/app/Activity;III)[Ljava/lang/String;"),
+                &[
+                    JValue::Object(&activity),
+                    JValue::Int(dimension(max_width)),
+                    JValue::Int(dimension(max_height)),
+                    JValue::Int(image_quality.unwrap_or(0).into()),
+                ],
             )
             .and_then(|v| v.l())
             .or_clear(env)?;
@@ -120,4 +128,9 @@ pub fn pick_video(
         let name = path.rsplit('/').next().unwrap_or(&path).to_string();
         Ok(Some(PickedFile { path, name }))
     })
+}
+
+/// A size limit in pixels for Java, where 0 means none.
+fn dimension(limit: Option<f64>) -> i32 {
+    limit.map_or(0, |limit| limit.round().clamp(1.0, i32::MAX as f64) as i32)
 }

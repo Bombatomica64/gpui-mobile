@@ -4,10 +4,21 @@ import android.app.Activity;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.database.Cursor;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.graphics.Matrix;
+import android.media.ExifInterface;
 import android.net.Uri;
 import android.os.Bundle;
+import android.provider.OpenableColumns;
 
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
 import java.util.ArrayList;
+import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 
 /**
@@ -28,18 +39,39 @@ public class GpuiPickerActivity extends Activity {
 
     private static final int REQUEST_CODE = 9001;
     private static final String KEY_WAITING = "gpui_waiting_for_result";
+    private static final String KEY_IMPORTING = "gpui_importing";
     static final String PREFS_NAME = "gpui_picker_prefs";
     static final String PREF_PENDING_RESULT = "pending_result";
     static final String PREF_HAS_PENDING = "has_pending_result";
 
+    /**
+     * What to do with the picked documents. Without one, the caller gets the URIs.
+     *
+     * <p>With one, each document is copied into the cache directory (under its
+     * display name) while this Activity still holds the URI grants, and the caller
+     * gets file paths. {@code cameraOutput} is a file the camera app was asked to
+     * write instead. Images are scaled down to {@code maxWidth} x {@code maxHeight}
+     * and re-encoded at {@code quality} (0-100) when any of them is positive.</p>
+     */
+    static final class Import {
+        int maxWidth;
+        int maxHeight;
+        int quality;
+        File cameraOutput;
+    }
+
     /** One picker request, and the result the calling thread waits for. */
     private static final class Request {
         final Intent intent;
+        final Import importing;
         final CountDownLatch done = new CountDownLatch(1);
         ArrayList<String> uris;
         Exception error;
 
-        Request(Intent intent) { this.intent = intent; }
+        Request(Intent intent, Import importing) {
+            this.intent = intent;
+            this.importing = importing;
+        }
 
         synchronized void complete(ArrayList<String> uris, Exception error) {
             if (done.getCount() == 0) return;
@@ -58,6 +90,9 @@ public class GpuiPickerActivity extends Activity {
     /** Whether we are waiting for an onActivityResult callback. */
     private boolean mWaitingForResult = false;
 
+    /** Whether picked documents are being copied for {@link #mRequest}. */
+    private boolean mImporting = false;
+
     /**
      * Launch {@code intent} through this Activity and wait for its result.
      *
@@ -65,10 +100,10 @@ public class GpuiPickerActivity extends Activity {
      * returns or this Activity goes away (back, the task brought to front from the
      * launcher, ...).</p>
      *
-     * @return the picked URIs, or null if cancelled.
+     * @return the picked URIs, or file paths when {@code importing} is set; null if cancelled.
      */
-    static ArrayList<String> launch(Activity activity, Intent intent) throws Exception {
-        Request request = new Request(intent);
+    static ArrayList<String> launch(Activity activity, Intent intent, Import importing) throws Exception {
+        Request request = new Request(intent, importing);
         synchronized (GpuiPickerActivity.class) {
             if (sPending != null) throw new IllegalStateException("A picker is already open");
             sPending = request;
@@ -89,6 +124,26 @@ public class GpuiPickerActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         synchronized (GpuiPickerActivity.class) { mRequest = sPending; }
+
+        if (savedInstanceState != null && savedInstanceState.getBoolean(KEY_IMPORTING, false)) {
+            // Recreated (e.g. rotated) while copying: the copy carries on and
+            // completes the request; don't open the picker again.
+            if (mRequest == null) {
+                finish();
+                return;
+            }
+            mImporting = true;
+            Request request = mRequest;
+            new Thread(() -> {
+                try {
+                    request.done.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                runOnUiThread(this::finish);
+            }, "gpui-picker-wait").start();
+            return;
+        }
 
         if (savedInstanceState != null && savedInstanceState.getBoolean(KEY_WAITING, false)) {
             // Recreated while the system picker was showing (after process death,
@@ -117,26 +172,58 @@ public class GpuiPickerActivity extends Activity {
     protected void onSaveInstanceState(Bundle outState) {
         super.onSaveInstanceState(outState);
         outState.putBoolean(KEY_WAITING, mWaitingForResult);
+        outState.putBoolean(KEY_IMPORTING, mImporting);
     }
 
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
         mWaitingForResult = false;
+        if (requestCode != REQUEST_CODE) return;
 
-        ArrayList<String> uris = null;
-        if (requestCode == REQUEST_CODE && resultCode == RESULT_OK && data != null) {
-            uris = extractUris(data);
+        ArrayList<Uri> uris = new ArrayList<>();
+        if (resultCode == RESULT_OK && data != null) uris = extractUris(data);
+        Import importing = mRequest != null ? mRequest.importing : null;
+        if (importing == null || resultCode != RESULT_OK) {
+            deliverResult(resultCode == RESULT_OK ? toStrings(uris) : null);
+            finish();
+            return;
         }
-
-        deliverResult(uris);
-        finish();
+        final ArrayList<Uri> picked = uris;
+        final Request request = mRequest;
+        mImporting = true;
+        // Keep this Activity (and its temporary URI grants) alive while copying;
+        // documents from remote providers can be large, so not on the UI thread.
+        new Thread(() -> {
+            ArrayList<String> paths = new ArrayList<>();
+            try {
+                if (importing.cameraOutput != null) {
+                    if (importing.cameraOutput.length() > 0) {
+                        paths.add(scaleImage(importing.cameraOutput, importing).getAbsolutePath());
+                    }
+                } else {
+                    for (Uri uri : picked) {
+                        File file = importFile(uri);
+                        if (importing.maxWidth > 0 || importing.maxHeight > 0 || importing.quality > 0) {
+                            file = scaleImage(file, importing);
+                        }
+                        paths.add(file.getAbsolutePath());
+                    }
+                }
+                request.complete(paths.isEmpty() ? null : paths, null);
+            } catch (Exception e) {
+                request.complete(null, e);
+            } finally {
+                runOnUiThread(this::finish);
+            }
+        }, "gpui-picker-import").start();
     }
 
     @Override
     protected void onDestroy() {
         // Gone without a result: back, or the task brought to front from the launcher.
-        if (isFinishing() && mRequest != null) mRequest.complete(null, null);
+        // (While importing, the copy completes it instead.)
+        if (isFinishing() && mRequest != null && !mImporting) mRequest.complete(null, null);
         super.onDestroy();
     }
 
@@ -157,20 +244,114 @@ public class GpuiPickerActivity extends Activity {
     /**
      * Extract URIs from the picker result intent.
      */
-    private static ArrayList<String> extractUris(Intent data) {
-        ArrayList<String> uris = new ArrayList<>();
+    private static ArrayList<Uri> extractUris(Intent data) {
+        ArrayList<Uri> uris = new ArrayList<>();
         if (data.getClipData() != null) {
             int count = data.getClipData().getItemCount();
             for (int i = 0; i < count; i++) {
                 Uri uri = data.getClipData().getItemAt(i).getUri();
                 if (uri != null) {
-                    uris.add(uri.toString());
+                    uris.add(uri);
                 }
             }
         } else if (data.getData() != null) {
-            uris.add(data.getData().toString());
+            uris.add(data.getData());
         }
         return uris;
+    }
+
+    private static ArrayList<String> toStrings(ArrayList<Uri> uris) {
+        ArrayList<String> strings = new ArrayList<>();
+        for (Uri uri : uris) strings.add(uri.toString());
+        return strings;
+    }
+
+    /** A new, empty directory in the cache for one picked file. */
+    static File newCacheDirectory(Context context) throws IOException {
+        File directory = new File(new File(context.getCacheDir(), "gpui-picked"), UUID.randomUUID().toString());
+        if (!directory.mkdirs()) throw new IOException("Could not create " + directory);
+        return directory;
+    }
+
+    /** Copy a document into the cache, keeping its display name. */
+    private File importFile(Uri uri) throws IOException {
+        String name = null;
+        try (Cursor cursor = getContentResolver().query(uri,
+                new String[] { OpenableColumns.DISPLAY_NAME }, null, null, null)) {
+            if (cursor != null && cursor.moveToFirst()) name = cursor.getString(0);
+        } catch (Exception e) {
+            // Not every provider answers queries; fall back to the URI.
+        }
+        if (name == null || name.isEmpty()) name = uri.getLastPathSegment();
+        // A provider's display name must not escape the import directory.
+        if (name == null) name = "file";
+        name = name.replace('/', '_').replace('\\', '_').replace('\0', '_');
+        if (name.isEmpty() || name.equals(".") || name.equals("..")) name = "file";
+        File file = new File(newCacheDirectory(this), name);
+        try (InputStream input = getContentResolver().openInputStream(uri);
+             FileOutputStream output = new FileOutputStream(file)) {
+            if (input == null) throw new IOException("Could not read " + uri);
+            byte[] buffer = new byte[64 * 1024];
+            int count;
+            while ((count = input.read(buffer)) != -1) output.write(buffer, 0, count);
+        }
+        return file;
+    }
+
+    /**
+     * Scale an image down to fit {@code importing}'s bounds, upright, re-encoded at
+     * its quality. Returns {@code file} itself when it is not an image or needs nothing.
+     */
+    private static File scaleImage(File file, Import importing) throws IOException {
+        BitmapFactory.Options bounds = new BitmapFactory.Options();
+        bounds.inJustDecodeBounds = true;
+        BitmapFactory.decodeFile(file.getPath(), bounds);
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return file; // not an image
+
+        int rotation = 0;
+        try {
+            switch (new ExifInterface(file.getPath()).getAttributeInt(
+                    ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)) {
+                case ExifInterface.ORIENTATION_ROTATE_90: rotation = 90; break;
+                case ExifInterface.ORIENTATION_ROTATE_180: rotation = 180; break;
+                case ExifInterface.ORIENTATION_ROTATE_270: rotation = 270; break;
+            }
+        } catch (IOException e) {
+            // No readable EXIF: keep the stored orientation.
+        }
+        boolean turned = rotation == 90 || rotation == 270;
+        int width = turned ? bounds.outHeight : bounds.outWidth;
+        int height = turned ? bounds.outWidth : bounds.outHeight;
+        double scale = 1.0;
+        if (importing.maxWidth > 0) scale = Math.min(scale, (double) importing.maxWidth / width);
+        if (importing.maxHeight > 0) scale = Math.min(scale, (double) importing.maxHeight / height);
+        if (scale >= 1.0 && importing.quality <= 0 && rotation == 0) return file;
+
+        BitmapFactory.Options decode = new BitmapFactory.Options();
+        decode.inSampleSize = 1;
+        while (scale * decode.inSampleSize * 2 <= 1.0) decode.inSampleSize *= 2;
+        Bitmap bitmap = BitmapFactory.decodeFile(file.getPath(), decode);
+        if (bitmap == null) return file;
+        Matrix matrix = new Matrix();
+        double sampled = scale * decode.inSampleSize;
+        if (sampled < 1.0) matrix.postScale((float) sampled, (float) sampled);
+        matrix.postRotate(rotation);
+        Bitmap output = Bitmap.createBitmap(bitmap, 0, 0, bitmap.getWidth(), bitmap.getHeight(), matrix, true);
+
+        String name = file.getName();
+        int dot = name.lastIndexOf('.');
+        boolean png = name.toLowerCase(java.util.Locale.ROOT).endsWith(".png");
+        File scaled = new File(file.getParentFile(),
+                (dot > 0 ? name.substring(0, dot) : name) + "-scaled" + (png ? ".png" : ".jpg"));
+        try (FileOutputStream stream = new FileOutputStream(scaled)) {
+            output.compress(png ? Bitmap.CompressFormat.PNG : Bitmap.CompressFormat.JPEG,
+                    importing.quality > 0 ? Math.min(importing.quality, 100) : 100, stream);
+        } finally {
+            if (output != bitmap) output.recycle();
+            bitmap.recycle();
+        }
+        file.delete();
+        return scaled;
     }
 
     /**

@@ -21,14 +21,14 @@ public final class GpuiFilePicker {
      *
      * @param activity The current Activity.
      * @param mimeTypes Pipe-separated MIME types (e.g. "image/jpeg|image/png") or "*\/*" for all.
-     * @return The selected file URI as a string, or null if cancelled.
+     * @return The path of a copy of the selected file in the cache directory, or null if cancelled.
      */
     public static String openFile(final Activity activity, final String mimeTypes) throws Exception {
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
         intent.addCategory(Intent.CATEGORY_OPENABLE);
         applyMimeTypes(intent, mimeTypes);
 
-        ArrayList<String> result = launchPicker(activity, intent);
+        ArrayList<String> result = GpuiPickerActivity.launch(activity, intent, new GpuiPickerActivity.Import());
         if (result != null && !result.isEmpty()) {
             return result.get(0);
         }
@@ -40,7 +40,7 @@ public final class GpuiFilePicker {
      *
      * @param activity The current Activity.
      * @param mimeTypes Pipe-separated MIME types.
-     * @return Array of selected file URIs, or null if cancelled.
+     * @return Paths of copies of the selected files in the cache directory, or null if cancelled.
      */
     public static String[] openFiles(final Activity activity, final String mimeTypes) throws Exception {
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
@@ -48,7 +48,7 @@ public final class GpuiFilePicker {
         intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
         applyMimeTypes(intent, mimeTypes);
 
-        ArrayList<String> result = launchPicker(activity, intent);
+        ArrayList<String> result = GpuiPickerActivity.launch(activity, intent, new GpuiPickerActivity.Import());
         if (result != null) {
             return result.toArray(new String[0]);
         }
@@ -97,7 +97,7 @@ public final class GpuiFilePicker {
     // ── Internal ─────────────────────────────────────────────────────────
 
     private static ArrayList<String> launchPicker(Activity activity, Intent intent) throws Exception {
-        return GpuiPickerActivity.launch(activity, intent);
+        return GpuiPickerActivity.launch(activity, intent, null);
     }
 
     private static void applyMimeTypes(Intent intent, String mimeTypes) {
