@@ -13,35 +13,21 @@ pub fn get_calendars() -> Result<Vec<Calendar>, String> {
             .call_static_method(
                 &cls,
                 jni::jni_str!("getCalendars"),
-                jni::jni_sig!("(Landroid/app/Activity;)Ljava/lang/String;"),
+                jni::jni_sig!("(Landroid/app/Activity;)[Ljava/lang/String;"),
                 &[JValue::Object(&activity)],
             )
             .and_then(|v| v.l())
             .or_clear(env)?;
 
-        if result.is_null() {
-            return Ok(vec![]);
-        }
-
-        let result_str = get_string(env, &result);
-        if result_str.is_empty() {
-            return Ok(vec![]);
-        }
-
-        let calendars = result_str
-            .lines()
-            .filter(|line| !line.is_empty())
-            .filter_map(|line| {
-                let parts: Vec<&str> = line.splitn(4, '|').collect();
-                if parts.len() < 4 {
-                    return None;
-                }
-                Some(Calendar {
-                    id: parts[0].to_string(),
-                    name: parts[1].to_string(),
-                    is_read_only: parts[2] == "1",
-                    color: parts[3].parse::<u64>().unwrap_or(0) as u32,
-                })
+        let fields = jni_helpers::get_string_array(env, &result)?;
+        let (rows, _) = fields.as_chunks::<4>();
+        let calendars = rows
+            .iter()
+            .map(|row| Calendar {
+                id: row[0].clone(),
+                name: row[1].clone(),
+                is_read_only: row[2] == "1",
+                color: row[3].parse::<u64>().unwrap_or(0) as u32,
             })
             .collect();
 
@@ -65,7 +51,7 @@ pub fn get_events(
             .call_static_method(
                 &cls,
                 jni::jni_str!("getEvents"),
-                jni::jni_sig!("(Landroid/app/Activity;Ljava/lang/String;JJ)Ljava/lang/String;"),
+                jni::jni_sig!("(Landroid/app/Activity;Ljava/lang/String;JJ)[Ljava/lang/String;"),
                 &[
                     JValue::Object(&activity),
                     JValue::Object(&j_calendar_id),
@@ -76,33 +62,19 @@ pub fn get_events(
             .and_then(|v| v.l())
             .or_clear(env)?;
 
-        if result.is_null() {
-            return Ok(vec![]);
-        }
-
-        let result_str = get_string(env, &result);
-        if result_str.is_empty() {
-            return Ok(vec![]);
-        }
-
-        let events = result_str
-            .lines()
-            .filter(|line| !line.is_empty())
-            .filter_map(|line| {
-                let parts: Vec<&str> = line.splitn(8, '|').collect();
-                if parts.len() < 8 {
-                    return None;
-                }
-                Some(CalendarEvent {
-                    id: parts[0].to_string(),
-                    title: parts[1].to_string(),
-                    description: parts[2].to_string(),
-                    location: parts[3].to_string(),
-                    start_ms: parts[4].parse().unwrap_or(0),
-                    end_ms: parts[5].parse().unwrap_or(0),
-                    all_day: parts[6] == "1",
-                    calendar_id: parts[7].to_string(),
-                })
+        let fields = jni_helpers::get_string_array(env, &result)?;
+        let (rows, _) = fields.as_chunks::<8>();
+        let events = rows
+            .iter()
+            .map(|row| CalendarEvent {
+                id: row[0].clone(),
+                title: row[1].clone(),
+                description: row[2].clone(),
+                location: row[3].clone(),
+                start_ms: row[4].parse().unwrap_or(0),
+                end_ms: row[5].parse().unwrap_or(0),
+                all_day: row[6] == "1",
+                calendar_id: row[7].clone(),
             })
             .collect();
 

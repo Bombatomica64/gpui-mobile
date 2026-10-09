@@ -231,6 +231,25 @@ pub fn get_string(env: &mut jni::Env<'_>, obj: &JObject<'_>) -> String {
     jstr.to_string()
 }
 
+/// The elements of a Java `String[]`: empty for a null array, `""` for a null element.
+pub(crate) fn get_string_array(
+    env: &mut jni::Env<'_>,
+    array: &JObject<'_>,
+) -> Result<Vec<String>, String> {
+    if array.is_null() {
+        return Ok(Vec::new());
+    }
+    // SAFETY: the callers pass the result of a method declared to return `String[]`.
+    let array = unsafe { jni::objects::JObjectArray::<JObject>::from_raw(env, array.as_raw()) };
+    let len = array.len(env).e()?;
+    let mut strings = Vec::with_capacity(len);
+    for index in 0..len {
+        let element: JObject = array.get_element(env, index).e()?;
+        strings.push(get_string(env, &element));
+    }
+    Ok(strings)
+}
+
 /// Extension trait for converting `jni::errors::Result<T>` to `Result<T, String>`.
 ///
 /// Leaves a Java exception pending; use [`JniResultExt::or_clear`] for calls into
