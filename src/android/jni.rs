@@ -157,16 +157,34 @@ pub fn activity<'local>(env: &jni::Env<'local>) -> Result<JObject<'local>, Strin
 
 /// Convert a Java String (`JObject` wrapping a `java.lang.String`) to a Rust `String`.
 ///
-/// Returns an empty string on null or error.
+/// Returns an empty string on null, on an object that is not a `String`, or on error.
 pub fn get_string(env: &mut jni::Env<'_>, obj: &JObject<'_>) -> String {
     if obj.is_null() {
         return String::new();
     }
+    match env.is_instance_of(obj, jni::jni_str!("java/lang/String")) {
+        Ok(true) => {}
+        Ok(false) => {
+            log::warn!("get_string: not a java.lang.String");
+            return String::new();
+        }
+        Err(err) => {
+            log::warn!(
+                "get_string: {}",
+                take_exception(env).unwrap_or(err.to_string())
+            );
+            return String::new();
+        }
+    }
+    // SAFETY: `obj` is a live, non-null reference to a `java.lang.String`.
     let jstr = unsafe { JString::from_raw(env, obj.as_raw()) };
     jstr.to_string()
 }
 
 /// Extension trait for converting `jni::errors::Result<T>` to `Result<T, String>`.
+///
+/// Leaves a Java exception pending; use [`JniResultExt::or_clear`] for calls into
+/// Java.
 pub(crate) trait JniExt<T> {
     fn e(self) -> Result<T, String>;
 }
@@ -174,6 +192,41 @@ pub(crate) trait JniExt<T> {
 impl<T> JniExt<T> for jni::errors::Result<T> {
     fn e(self) -> Result<T, String> {
         self.map_err(|e| e.to_string())
+    }
+}
+
+/// Error handling for calls into Java.
+pub(crate) trait JniResultExt<T> {
+    /// On error, clear the pending Java exception, if any, and describe it: later
+    /// JNI calls in the same frame would otherwise fail too, and the bare JNI error
+    /// only says that an exception was thrown.
+    fn or_clear(self, env: &mut jni::Env<'_>) -> Result<T, String>;
+}
+
+impl<T> JniResultExt<T> for jni::errors::Result<T> {
+    fn or_clear(self, env: &mut jni::Env<'_>) -> Result<T, String> {
+        self.map_err(|err| take_exception(env).unwrap_or_else(|| err.to_string()))
+    }
+}
+
+/// Clear the pending Java exception and return its `toString()`, if there is one.
+pub(crate) fn take_exception(env: &mut jni::Env<'_>) -> Option<String> {
+    let throwable = env.exception_occurred()?;
+    env.exception_clear();
+    let description = env
+        .call_method(
+            &throwable,
+            jni::jni_str!("toString"),
+            jni::jni_sig!("()Ljava/lang/String;"),
+            &[],
+        )
+        .and_then(|value| value.l());
+    match description {
+        Ok(description) => Some(get_string(env, &description)),
+        Err(_) => {
+            env.exception_clear();
+            Some("a Java exception was thrown".into())
+        }
     }
 }
 
@@ -1340,10 +1393,7 @@ pub fn set_system_chrome(style: &crate::SystemChromeStyle) {
                 &[],
             )
             .and_then(|v: jni::objects::JValueOwned| v.l())
-            .map_err(|e| {
-                env.exception_clear();
-                e.to_string()
-            })?;
+            .or_clear(env)?;
         if window.is_null() {
             return Err("getWindow returned null".into());
         }
@@ -1532,7 +1582,7 @@ pub fn show_keyboard_android(keyboard_type: crate::KeyboardType) {
             jni::jni_sig!("(IJ)V"),
             &[JValue::Int(kind), JValue::Long(session as i64)],
         )
-        .map_err(|e| e.to_string())?;
+        .or_clear(env)?;
         Ok(())
     }) {
         log::warn!("IME requires GpuiInputActivity: {error}");
@@ -1559,7 +1609,7 @@ pub fn hide_keyboard_android() {
             &[JValue::Long(session as i64)],
         );
         env.exception_clear();
-        result.map_err(|e| e.to_string())?;
+        result.or_clear(env)?;
         Ok(())
     });
     if let Some(app) = android_app() {
@@ -1578,7 +1628,7 @@ pub(super) fn reset_keyboard_composition() {
             &[JValue::Long(session as i64)],
         );
         env.exception_clear();
-        result.map_err(|e| e.to_string())?;
+        result.or_clear(env)?;
         Ok(())
     });
 }
