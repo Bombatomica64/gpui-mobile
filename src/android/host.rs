@@ -57,7 +57,7 @@
 
 use std::{
     sync::{
-        atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering},
+        atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering},
         Arc, Mutex, OnceLock,
     },
     time::Duration,
@@ -78,8 +78,10 @@ static COMMANDS: Mutex<Vec<Command>> = Mutex::new(Vec::new());
 /// Set once the render thread is running; guards against a second spawn.
 static STARTED: OnceLock<()> = OnceLock::new();
 
-/// Cleared by the render thread once it has released the outgoing surface.
-static SURFACE_RELEASED: AtomicBool = AtomicBool::new(true);
+/// Surface-destroy requests posted by [`surface_destroyed`], and how many of them the
+/// render thread has handled. Each caller waits until its own request is handled.
+static DESTROYS_REQUESTED: AtomicU64 = AtomicU64::new(0);
+static DESTROYS_HANDLED: AtomicU64 = AtomicU64::new(0);
 
 /// Scale factor of the current surface (`f32` bits), for the platform-view hit test
 /// in [`motion_event`], which runs on the Java UI thread and must not touch the window.
@@ -341,7 +343,7 @@ fn render_thread(launch: Launch) {
                         app.attached = None;
                         CURRENT_SURFACE.store(std::ptr::null_mut(), Ordering::SeqCst);
                     }
-                    SURFACE_RELEASED.store(true, Ordering::SeqCst);
+                    DESTROYS_HANDLED.fetch_add(1, Ordering::SeqCst);
                 }
                 Command::HostDestroyed { host } => {
                     app.failed.remove(&host);
@@ -430,8 +432,6 @@ fn on_surface_created(
     scale: f32,
     app: &mut HostApp,
 ) {
-    SURFACE_RELEASED.store(false, Ordering::SeqCst);
-
     if app.failed.contains(&host) {
         log::info!("gpui-main: host {host} already failed; ignoring its surface");
         return;
@@ -564,17 +564,19 @@ pub fn host_destroyed(host: HostId) {
 /// framework, otherwise the `Surface` is torn down underneath a thread that may be
 /// inside `ANativeWindow_lock`.
 pub fn surface_destroyed(host: HostId) {
+    // Commands are handled in order, so once the handled count reaches this request's
+    // number, this destroy has been handled. A single flag set here and cleared by
+    // `SurfaceCreated` could still read "released" from an earlier destroy while a
+    // `SurfaceCreated` posted before this one sits unhandled in the queue, letting the
+    // `Surface` go while the render thread is about to draw into it. Numbering relies
+    // on every caller being on the Java UI thread, as `SurfaceHolder.Callback` is.
+    let request = DESTROYS_REQUESTED.fetch_add(1, Ordering::SeqCst) + 1;
     post(Command::SurfaceDestroyed { host });
 
-    // One global flag serves every host because `SurfaceHolder.Callback` fires on the
-    // Java UI thread: while this blocks, no other Activity can reach `surface_created`
-    // to clear it. Waiting per host would mean polling a map from a blocked UI thread
-    // for no gain.
-    //
     // Bounded wait: a stuck render thread must not turn into an ANR. 2 s is far below
     // the 5 s input-dispatch timeout while being far above a worst-case frame.
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    while !SURFACE_RELEASED.load(Ordering::SeqCst) {
+    while DESTROYS_HANDLED.load(Ordering::SeqCst) < request {
         if std::time::Instant::now() >= deadline {
             log::error!(
                 "gpui-main: timed out waiting for the render thread to release the surface"
