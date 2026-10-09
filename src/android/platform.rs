@@ -879,7 +879,7 @@ impl AndroidPlatform {
 
             // context.getSystemService("power")
             let service_name = env.new_string("power").or_clear(env)?;
-            let pm = match env
+            let pm = env
                 .call_method(
                     &context,
                     jni::jni_str!("getSystemService"),
@@ -887,16 +887,13 @@ impl AndroidPlatform {
                     &[JValue::Object(&service_name)],
                 )
                 .and_then(|v| v.l())
-            {
-                Ok(o) if !o.is_null() => o,
-                _ => {
-                    env.exception_clear();
-                    return Err("getSystemService(power) failed or returned null".to_string());
-                }
-            };
+                .or_clear(env)?;
+            if pm.is_null() {
+                return Err("getSystemService(power) returned null".to_string());
+            }
 
             // pm.getCurrentThermalStatus() — API 29+
-            let status = match env
+            let status = env
                 .call_method(
                     &pm,
                     jni::jni_str!("getCurrentThermalStatus"),
@@ -904,13 +901,7 @@ impl AndroidPlatform {
                     &[],
                 )
                 .and_then(|v| v.i())
-            {
-                Ok(s) => s,
-                Err(_) => {
-                    env.exception_clear();
-                    return Err("getCurrentThermalStatus() failed".to_string());
-                }
-            };
+                .or_clear(env)?;
 
             log::trace!("query_thermal_status_via_jni: status={}", status);
             Ok(status)

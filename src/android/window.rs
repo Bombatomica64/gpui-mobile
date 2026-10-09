@@ -1992,7 +1992,7 @@ impl PlatformWindow for AndroidPlatformWindow {
                     )
                     .or_clear(env)?;
 
-                let _ = env.call_method(
+                env.call_method(
                     &builder,
                     jni::jni_str!("setInsertionMarkerLocation"),
                     jni::jni_sig!("(FFFFI)Landroid/view/inputmethod/CursorAnchorInfo$Builder;"),
@@ -2003,8 +2003,8 @@ impl PlatformWindow for AndroidPlatformWindow {
                         JValue::Float(y + h),
                         JValue::Int(0),
                     ],
-                );
-                env.exception_clear();
+                )
+                .or_clear(env)?;
 
                 let anchor_info = env
                     .call_method(
@@ -2047,15 +2047,15 @@ impl PlatformWindow for AndroidPlatformWindow {
                 }
 
                 // 4. imm.updateCursorAnchorInfo(view, info)
-                let _ = env.call_method(
+                env.call_method(
                     &imm,
                     jni::jni_str!("updateCursorAnchorInfo"),
                     jni::jni_sig!(
                         "(Landroid/view/View;Landroid/view/inputmethod/CursorAnchorInfo;)V"
                     ),
                     &[JValue::Object(&decor_view), JValue::Object(&anchor_info)],
-                );
-                env.exception_clear();
+                )
+                .or_clear(env)?;
 
                 log::trace!("update_ime_position: x={:.0} y={:.0} h={:.0}", x, y, h);
 

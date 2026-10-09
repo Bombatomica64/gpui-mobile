@@ -232,11 +232,41 @@ pub(crate) trait JniResultExt<T> {
     /// JNI calls in the same frame would otherwise fail too, and the bare JNI error
     /// only says that an exception was thrown.
     fn or_clear(self, env: &mut jni::Env<'_>) -> Result<T, String>;
+
+    /// Like [`or_clear`](Self::or_clear), but an exception that is an instance of
+    /// `class` (a JNI class name, e.g. `android/content/ActivityNotFoundException`)
+    /// is an expected outcome: it is cleared and the result is `Ok(None)`.
+    fn or_catch(
+        self,
+        env: &mut jni::Env<'_>,
+        class: &'static jni::strings::JNIStr,
+    ) -> Result<Option<T>, String>;
 }
 
 impl<T> JniResultExt<T> for jni::errors::Result<T> {
     fn or_clear(self, env: &mut jni::Env<'_>) -> Result<T, String> {
         self.map_err(|err| take_exception(env).unwrap_or_else(|| err.to_string()))
+    }
+
+    fn or_catch(
+        self,
+        env: &mut jni::Env<'_>,
+        class: &'static jni::strings::JNIStr,
+    ) -> Result<Option<T>, String> {
+        match self {
+            Ok(value) => Ok(Some(value)),
+            Err(err) => {
+                let Some(throwable) = env.exception_occurred() else {
+                    return Err(err.to_string());
+                };
+                env.exception_clear();
+                if env.is_instance_of(&throwable, class).unwrap_or(false) {
+                    return Ok(None);
+                }
+                env.throw(&throwable).ok();
+                Err(take_exception(env).unwrap_or_else(|| err.to_string()))
+            }
+        }
     }
 }
 
@@ -366,34 +396,28 @@ static PLATFORM: OnceLock<Arc<AndroidPlatform>> = OnceLock::new();
 /// `getUnicodeChar(metaState)` on it.  Returns 0 on failure.
 pub fn unicode_char_for_key_event(key_code: i32, action: i32, meta_state: i32) -> u32 {
     with_env(|env| {
-        let key_event = match env.new_object(
-            jni::jni_str!("android/view/KeyEvent"),
-            jni::jni_sig!("(II)V"),
-            &[JValue::Int(action), JValue::Int(key_code)],
-        ) {
-            Ok(o) => o,
-            Err(_) => {
-                env.exception_clear();
-                return Ok(0);
-            }
-        };
-        match env.call_method(
-            &key_event,
-            jni::jni_str!("getUnicodeChar"),
-            jni::jni_sig!("(I)I"),
-            &[JValue::Int(meta_state)],
-        ) {
-            Ok(v) => {
-                let c = v.i().unwrap_or(0);
-                Ok(if c > 0 { c as u32 } else { 0 })
-            }
-            Err(_) => {
-                env.exception_clear();
-                Ok(0)
-            }
-        }
+        let key_event = env
+            .new_object(
+                jni::jni_str!("android/view/KeyEvent"),
+                jni::jni_sig!("(II)V"),
+                &[JValue::Int(action), JValue::Int(key_code)],
+            )
+            .or_clear(env)?;
+        let c = env
+            .call_method(
+                &key_event,
+                jni::jni_str!("getUnicodeChar"),
+                jni::jni_sig!("(I)I"),
+                &[JValue::Int(meta_state)],
+            )
+            .and_then(|v| v.i())
+            .or_clear(env)?;
+        Ok(c.max(0) as u32)
     })
-    .unwrap_or(0)
+    .unwrap_or_else(|err| {
+        log::warn!("unicode_char_for_key_event: {err}");
+        0
+    })
 }
 
 // ── public accessors ──────────────────────────────────────────────────────────
@@ -462,12 +486,7 @@ pub fn set_host_activity(env: &mut jni::Env<'_>, activity: &JObject<'_>) -> Resu
             Ok(context) => {
                 let _ = HOST_APPLICATION.set(context);
             }
-            Err(err) => {
-                if env.exception_check() {
-                    env.exception_clear();
-                }
-                log::warn!("set_host_activity: no application context: {err}");
-            }
+            Err(err) => log::warn!("set_host_activity: no application context: {err}"),
         }
     }
     if HOST_ASSETS.get().is_none() {
@@ -475,12 +494,7 @@ pub fn set_host_activity(env: &mut jni::Env<'_>, activity: &JObject<'_>) -> Resu
             Ok(assets) => {
                 let _ = HOST_ASSETS.set(assets);
             }
-            Err(err) => {
-                if env.exception_check() {
-                    env.exception_clear();
-                }
-                log::warn!("set_host_activity: no AssetManager: {err}");
-            }
+            Err(err) => log::warn!("set_host_activity: no AssetManager: {err}"),
         }
     }
     Ok(())
@@ -503,7 +517,7 @@ fn fetch_application_context(
             &[],
         )
         .and_then(|value| value.l())
-        .e()?;
+        .or_clear(env)?;
     if context.is_null() {
         return Err("getApplicationContext returned null".into());
     }
@@ -530,7 +544,7 @@ fn host_assets(env: &mut jni::Env<'_>, activity: &JObject<'_>) -> Result<HostAss
             &[],
         )
         .and_then(|value| value.l())
-        .e()?;
+        .or_clear(env)?;
     let assets = env
         .call_method(
             &context,
@@ -539,7 +553,7 @@ fn host_assets(env: &mut jni::Env<'_>, activity: &JObject<'_>) -> Result<HostAss
             &[],
         )
         .and_then(|value| value.l())
-        .e()?;
+        .or_clear(env)?;
     if assets.is_null() {
         return Err("getAssets returned null".into());
     }
@@ -775,30 +789,27 @@ fn host_ui_mode() -> Result<i32, String> {
         .get()
         .ok_or("set_host_activity has not been called")?;
     with_env(|env| {
-        let result = (|| {
-            let resources = env
-                .call_method(
-                    context,
-                    jni::jni_str!("getResources"),
-                    jni::jni_sig!("()Landroid/content/res/Resources;"),
-                    &[],
-                )?
-                .l()?;
-            let config = env
-                .call_method(
-                    &resources,
-                    jni::jni_str!("getConfiguration"),
-                    jni::jni_sig!("()Landroid/content/res/Configuration;"),
-                    &[],
-                )?
-                .l()?;
-            env.get_field(&config, jni::jni_str!("uiMode"), jni::jni_sig!("I"))?
-                .i()
-        })();
-        if result.is_err() {
-            env.exception_clear();
-        }
-        result.e()
+        let resources = env
+            .call_method(
+                context,
+                jni::jni_str!("getResources"),
+                jni::jni_sig!("()Landroid/content/res/Resources;"),
+                &[],
+            )
+            .and_then(|v| v.l())
+            .or_clear(env)?;
+        let config = env
+            .call_method(
+                &resources,
+                jni::jni_str!("getConfiguration"),
+                jni::jni_sig!("()Landroid/content/res/Configuration;"),
+                &[],
+            )
+            .and_then(|v| v.l())
+            .or_clear(env)?;
+        env.get_field(&config, jni::jni_str!("uiMode"), jni::jni_sig!("I"))
+            .and_then(|v| v.i())
+            .or_clear(env)
     })
 }
 
@@ -1288,13 +1299,15 @@ pub fn run_event_loop(app: &AndroidApp) {
 fn pause_platform_views() {
     let _ = with_env(|env| {
         if let Ok(helper_class) = find_app_class(env, "dev.gpui.mobile.GpuiPlatformView") {
-            let _ = env.call_static_method(
+            let result = env.call_static_method(
                 &helper_class,
                 jni::jni_str!("pauseAll"),
                 jni::jni_sig!("()V"),
                 &[],
             );
-            env.exception_clear();
+            if let Err(err) = result.or_clear(env) {
+                log::warn!("pauseAll: {err}");
+            }
         }
         Ok(())
     });
@@ -1304,13 +1317,15 @@ fn pause_platform_views() {
 fn resume_platform_views() {
     let _ = with_env(|env| {
         if let Ok(helper_class) = find_app_class(env, "dev.gpui.mobile.GpuiPlatformView") {
-            let _ = env.call_static_method(
+            let result = env.call_static_method(
                 &helper_class,
                 jni::jni_str!("resumeAll"),
                 jni::jni_sig!("()V"),
                 &[],
             );
-            env.exception_clear();
+            if let Err(err) = result.or_clear(env) {
+                log::warn!("resumeAll: {err}");
+            }
         }
         Ok(())
     });
@@ -1320,13 +1335,15 @@ fn resume_platform_views() {
 fn dispose_all_platform_views() {
     let _ = with_env(|env| {
         if let Ok(helper_class) = find_app_class(env, "dev.gpui.mobile.GpuiPlatformView") {
-            let _ = env.call_static_method(
+            let result = env.call_static_method(
                 &helper_class,
                 jni::jni_str!("disposeAll"),
                 jni::jni_sig!("()V"),
                 &[],
             );
-            env.exception_clear();
+            if let Err(err) = result.or_clear(env) {
+                log::warn!("disposeAll: {err}");
+            }
         }
         Ok(())
     });
@@ -1576,87 +1593,96 @@ pub fn set_system_chrome(style: &crate::SystemChromeStyle) {
             // 2. Set status bar color if provided
             if let Some(color) = status_bar_color {
                 let argb = (0xFF000000_u32 | color) as i32;
-                let _ = env.call_method(
+                let result = env.call_method(
                     &window,
                     jni::jni_str!("setStatusBarColor"),
                     jni::jni_sig!("(I)V"),
                     &[JValue::Int(argb)],
                 );
-                env.exception_clear();
+                if let Err(err) = result.or_clear(env) {
+                    log::warn!("setStatusBarColor: {err}");
+                }
             }
 
             // 3. Set navigation bar color if provided
             if let Some(color) = navigation_bar_color {
                 let argb = (0xFF000000_u32 | color) as i32;
-                let _ = env.call_method(
+                let result = env.call_method(
                     &window,
                     jni::jni_str!("setNavigationBarColor"),
                     jni::jni_sig!("(I)V"),
                     &[JValue::Int(argb)],
                 );
-                env.exception_clear();
+                if let Err(err) = result.or_clear(env) {
+                    log::warn!("setNavigationBarColor: {err}");
+                }
             }
 
-            // 4. Set light/dark status bar icons via WindowInsetsController (API 30+)
-            let insetsctl = env.call_method(
-                &window,
-                jni::jni_str!("getInsetsController"),
-                jni::jni_sig!("()Landroid/view/WindowInsetsController;"),
-                &[],
-            );
-
-            if let Ok(v) = insetsctl {
-                if let Ok(ctl) = v.l() {
-                    if !ctl.is_null() {
-                        let mask: i32 = 0x00000008;
-                        let appearance: i32 = match status_bar_style {
-                            crate::StatusBarContentStyle::Dark => 0x00000008,
-                            crate::StatusBarContentStyle::Light => 0,
-                        };
-                        let _ = env.call_method(
-                            &ctl,
-                            jni::jni_str!("setSystemBarsAppearance"),
-                            jni::jni_sig!("(II)V"),
-                            &[JValue::Int(appearance), JValue::Int(mask)],
-                        );
-                        env.exception_clear();
-                    }
-                }
-            } else {
-                env.exception_clear();
-
-                if let Ok(decor) = env
-                    .call_method(
-                        &window,
-                        jni::jni_str!("getDecorView"),
-                        jni::jni_sig!("()Landroid/view/View;"),
-                        &[],
+            // 4. Set light/dark status bar icons via WindowInsetsController (API 30+),
+            //    or the deprecated system UI visibility flags before it.
+            let controller = env
+                .call_method(
+                    &window,
+                    jni::jni_str!("getInsetsController"),
+                    jni::jni_sig!("()Landroid/view/WindowInsetsController;"),
+                    &[],
+                )
+                .and_then(|v| v.l())
+                .or_catch(env, jni::jni_str!("java/lang/NoSuchMethodError"))?;
+            match controller {
+                Some(controller) if !controller.is_null() => {
+                    const APPEARANCE_LIGHT_STATUS_BARS: i32 = 0x0000_0008;
+                    let appearance = match status_bar_style {
+                        crate::StatusBarContentStyle::Dark => APPEARANCE_LIGHT_STATUS_BARS,
+                        crate::StatusBarContentStyle::Light => 0,
+                    };
+                    env.call_method(
+                        &controller,
+                        jni::jni_str!("setSystemBarsAppearance"),
+                        jni::jni_sig!("(II)V"),
+                        &[
+                            JValue::Int(appearance),
+                            JValue::Int(APPEARANCE_LIGHT_STATUS_BARS),
+                        ],
                     )
-                    .and_then(|v: jni::objects::JValueOwned| v.l())
-                {
-                    if !decor.is_null() {
-                        if let Ok(current) = env
-                            .call_method(
-                                &decor,
-                                jni::jni_str!("getSystemUiVisibility"),
-                                jni::jni_sig!("()I"),
-                                &[],
-                            )
-                            .and_then(|v: jni::objects::JValueOwned| v.i())
-                        {
-                            let new_flags = match status_bar_style {
-                                crate::StatusBarContentStyle::Dark => current | 0x00002000,
-                                crate::StatusBarContentStyle::Light => current & !0x00002000,
-                            };
-                            let _ = env.call_method(
-                                &decor,
-                                jni::jni_str!("setSystemUiVisibility"),
-                                jni::jni_sig!("(I)V"),
-                                &[JValue::Int(new_flags)],
-                            );
-                            env.exception_clear();
+                    .or_clear(env)?;
+                }
+                Some(_) => {}
+                None => {
+                    const SYSTEM_UI_FLAG_LIGHT_STATUS_BAR: i32 = 0x0000_2000;
+                    let decor = env
+                        .call_method(
+                            &window,
+                            jni::jni_str!("getDecorView"),
+                            jni::jni_sig!("()Landroid/view/View;"),
+                            &[],
+                        )
+                        .and_then(|v| v.l())
+                        .or_clear(env)?;
+                    let current = env
+                        .call_method(
+                            &decor,
+                            jni::jni_str!("getSystemUiVisibility"),
+                            jni::jni_sig!("()I"),
+                            &[],
+                        )
+                        .and_then(|v| v.i())
+                        .or_clear(env)?;
+                    let flags = match status_bar_style {
+                        crate::StatusBarContentStyle::Dark => {
+                            current | SYSTEM_UI_FLAG_LIGHT_STATUS_BAR
                         }
-                    }
+                        crate::StatusBarContentStyle::Light => {
+                            current & !SYSTEM_UI_FLAG_LIGHT_STATUS_BAR
+                        }
+                    };
+                    env.call_method(
+                        &decor,
+                        jni::jni_str!("setSystemUiVisibility"),
+                        jni::jni_sig!("(I)V"),
+                        &[JValue::Int(flags)],
+                    )
+                    .or_clear(env)?;
                 }
             }
 
@@ -1761,10 +1787,6 @@ pub fn show_keyboard_android(keyboard_type: crate::KeyboardType) {
         Ok(())
     }) {
         log::warn!("IME requires GpuiInputActivity: {error}");
-        let _ = with_env(|env| {
-            env.exception_clear();
-            Ok(())
-        });
     }
 }
 
@@ -1775,18 +1797,19 @@ pub fn hide_keyboard_android() {
     *SHOWN_KEYBOARD.lock().expect("poisoned") = None;
     *DISMISSED_KEYBOARD.lock().expect("poisoned") = None;
     let session = super::text_input::new_session();
-    let _ = with_env(|env| {
+    if let Err(err) = with_env(|env| {
         let activity = activity(env)?;
-        let result = env.call_method(
+        env.call_method(
             &activity,
             jni::jni_str!("gpuiHideKeyboard"),
             jni::jni_sig!("(J)V"),
             &[JValue::Long(session as i64)],
-        );
-        env.exception_clear();
-        result.or_clear(env)?;
+        )
+        .or_clear(env)?;
         Ok(())
-    });
+    }) {
+        log::debug!("gpuiHideKeyboard: {err}");
+    }
     if let Some(app) = android_app() {
         app.hide_soft_input(false);
     }
@@ -1794,18 +1817,19 @@ pub fn hide_keyboard_android() {
 
 pub(super) fn reset_keyboard_composition() {
     let session = super::text_input::new_session();
-    let _ = with_env(|env| {
+    if let Err(err) = with_env(|env| {
         let activity = activity(env)?;
-        let result = env.call_method(
+        env.call_method(
             &activity,
             jni::jni_str!("gpuiResetComposition"),
             jni::jni_sig!("(J)V"),
             &[JValue::Long(session as i64)],
-        );
-        env.exception_clear();
-        result.or_clear(env)?;
+        )
+        .or_clear(env)?;
         Ok(())
-    });
+    }) {
+        log::debug!("gpuiResetComposition: {err}");
+    }
 }
 
 /// Receive Java InputConnection updates without touching GPUI on the UI thread.
@@ -1822,7 +1846,7 @@ pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiInputActivity_nativeIme(
     start: i32,
     end: i32,
 ) {
-    let _ = with_env(|env| {
+    if let Err(err) = with_env(|env| {
         // SAFETY: `text` is a local reference JNI passed to this call, valid until it
         // returns.
         let text = unsafe { JObject::from_raw(env, text as jni::sys::jobject) };
@@ -1834,7 +1858,9 @@ pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiInputActivity_nativeIme(
             end: end.max(0) as usize,
         });
         Ok(())
-    });
+    }) {
+        log::warn!("nativeIme: {err}");
+    }
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -1878,7 +1904,7 @@ pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiActivity_nativeOnDeepLink(
     // We already have a JVM attached on this thread (UI thread).
     // Use with_env to get a properly wrapped Env handle.
     let url_raw = url as jni::sys::jobject;
-    let _ = with_env(|env| {
+    if let Err(err) = with_env(|env| {
         // SAFETY: `url` is a local reference JNI passed to this call, valid until it
         // returns.
         let url_obj = unsafe { JObject::from_raw(env, url_raw) };
@@ -1893,7 +1919,9 @@ pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiActivity_nativeOnDeepLink(
             crate::packages::deeplink::notify_deep_link(&url_string);
         }
         Ok(())
-    });
+    }) {
+        log::warn!("nativeOnDeepLink: {err}");
+    }
 }
 
 /// JNI bridge: receive a media action from `GpuiMediaSession` system controls.
@@ -1910,7 +1938,7 @@ pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiMediaSession_nativeMediaAction
     action: *mut std::ffi::c_void,
 ) {
     let action_raw = action as jni::sys::jobject;
-    let _ = with_env(|env| {
+    if let Err(err) = with_env(|env| {
         // SAFETY: `action` is a local reference JNI passed to this call, valid until
         // it returns.
         let action_obj = unsafe { JObject::from_raw(env, action_raw) };
@@ -1931,7 +1959,9 @@ pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiMediaSession_nativeMediaAction
         log::info!("nativeMediaAction: {:?}", media_action);
         crate::packages::media_session::notify_action(media_action);
         Ok(())
-    });
+    }) {
+        log::warn!("nativeMediaAction: {err}");
+    }
 }
 
 /// JNI bridge: receive a seek request from `GpuiMediaSession` system controls.
