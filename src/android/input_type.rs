@@ -1,7 +1,7 @@
 //! Maps GPUI's [`TextInputConfiguration`] onto the `EditorInfo` a host's IME proxy
 //! hands the keyboard: `inputType` and `imeOptions`.
 
-use gpui::{Autocapitalize, TextInputAction, TextInputConfiguration};
+use gpui::{Autocapitalize, TextInputAction, TextInputConfiguration, TextInputPurpose};
 
 use crate::KeyboardType;
 
@@ -12,6 +12,8 @@ const TYPE_CLASS_NUMBER: i32 = 0x2;
 const TYPE_CLASS_PHONE: i32 = 0x3;
 const TYPE_TEXT_VARIATION_URI: i32 = 0x10;
 const TYPE_TEXT_VARIATION_EMAIL_ADDRESS: i32 = 0x20;
+const TYPE_TEXT_VARIATION_PASSWORD: i32 = 0x80;
+const TYPE_NUMBER_VARIATION_PASSWORD: i32 = 0x10;
 const TYPE_NUMBER_FLAG_DECIMAL: i32 = 0x2000;
 const TYPE_TEXT_FLAG_CAP_CHARACTERS: i32 = 0x1000;
 const TYPE_TEXT_FLAG_CAP_WORDS: i32 = 0x2000;
@@ -30,11 +32,13 @@ const IME_ACTION_DONE: i32 = 6;
 const IME_ACTION_PREVIOUS: i32 = 7;
 /// GPUI draws the field, so the IME must never cover the app with its own.
 const IME_FLAG_NO_EXTRACT_UI: i32 = 0x1000_0000;
+const IME_FLAG_NO_PERSONALIZED_LEARNING: i32 = 0x0100_0000;
 
 /// `(inputType, imeOptions)` for a field with this configuration.
 ///
-/// `keyboard` is the type an app asked for through
-/// [`crate::show_keyboard_with_type`]; anything but the default picks the class.
+/// The field's purpose picks the class (digits, phone pad, password…), unless an
+/// app asked for a `keyboard` type through [`crate::show_keyboard_with_type`].
+/// Passwords also get no text assistance and no personalized learning.
 ///
 /// A field whose confirm key inserts a line break (`Enter`, or no hint at all)
 /// is multi-line; any other action makes it a single-line field showing that
@@ -43,8 +47,22 @@ pub(super) fn editor_info(
     configuration: &TextInputConfiguration,
     keyboard: KeyboardType,
 ) -> (i32, i32) {
+    let purpose = configuration.purpose;
+    let secret = matches!(
+        purpose,
+        TextInputPurpose::Password | TextInputPurpose::NumericPassword
+    );
     let mut input_type = match keyboard {
-        KeyboardType::Default => TYPE_CLASS_TEXT,
+        KeyboardType::Default => match purpose {
+            TextInputPurpose::Text | TextInputPurpose::Search => TYPE_CLASS_TEXT,
+            TextInputPurpose::Email => TYPE_CLASS_TEXT | TYPE_TEXT_VARIATION_EMAIL_ADDRESS,
+            TextInputPurpose::Url => TYPE_CLASS_TEXT | TYPE_TEXT_VARIATION_URI,
+            TextInputPurpose::Phone => TYPE_CLASS_PHONE,
+            TextInputPurpose::Numeric => TYPE_CLASS_NUMBER,
+            TextInputPurpose::Decimal => TYPE_CLASS_NUMBER | TYPE_NUMBER_FLAG_DECIMAL,
+            TextInputPurpose::Password => TYPE_CLASS_TEXT | TYPE_TEXT_VARIATION_PASSWORD,
+            TextInputPurpose::NumericPassword => TYPE_CLASS_NUMBER | TYPE_NUMBER_VARIATION_PASSWORD,
+        },
         KeyboardType::EmailAddress => TYPE_CLASS_TEXT | TYPE_TEXT_VARIATION_EMAIL_ADDRESS,
         KeyboardType::Phone => TYPE_CLASS_PHONE,
         KeyboardType::NumberPad => TYPE_CLASS_NUMBER,
@@ -60,7 +78,10 @@ pub(super) fn editor_info(
         TextInputAction::Search => IME_ACTION_SEARCH,
         TextInputAction::Send => IME_ACTION_SEND,
     };
-    if input_type & TYPE_MASK_CLASS == TYPE_CLASS_TEXT {
+    let mut ime_options = action | IME_FLAG_NO_EXTRACT_UI;
+    if secret {
+        ime_options |= IME_FLAG_NO_PERSONALIZED_LEARNING;
+    } else if input_type & TYPE_MASK_CLASS == TYPE_CLASS_TEXT {
         if action == IME_ACTION_UNSPECIFIED {
             input_type |= TYPE_TEXT_FLAG_MULTI_LINE;
         }
@@ -77,7 +98,7 @@ pub(super) fn editor_info(
             input_type |= TYPE_TEXT_FLAG_NO_SUGGESTIONS;
         }
     }
-    (input_type, action | IME_FLAG_NO_EXTRACT_UI)
+    (input_type, ime_options)
 }
 
 /// Whether the IME action `action` (an `IME_ACTION_*`) ends editing, so the
@@ -101,6 +122,7 @@ mod tests {
             autocapitalize: Autocapitalize::Sentences,
             suggestions: true,
             input_action: TextInputAction::Enter,
+            ..Default::default()
         };
         assert_eq!(
             editor_info(&configuration, KeyboardType::Default),
@@ -145,6 +167,40 @@ mod tests {
         };
         let (input_type, _) = editor_info(&configuration, KeyboardType::Decimal);
         assert_eq!(input_type, TYPE_CLASS_NUMBER | TYPE_NUMBER_FLAG_DECIMAL);
+    }
+
+    #[test]
+    fn passwords_get_no_assistance_and_no_learning() {
+        let configuration = TextInputConfiguration {
+            autocorrect: true,
+            suggestions: true,
+            input_action: TextInputAction::Done,
+            purpose: TextInputPurpose::Password,
+            ..Default::default()
+        };
+        assert_eq!(
+            editor_info(&configuration, KeyboardType::Default),
+            (
+                TYPE_CLASS_TEXT | TYPE_TEXT_VARIATION_PASSWORD,
+                IME_ACTION_DONE | IME_FLAG_NO_EXTRACT_UI | IME_FLAG_NO_PERSONALIZED_LEARNING
+            )
+        );
+    }
+
+    #[test]
+    fn the_purpose_picks_the_keyboard_unless_the_app_asked_for_one() {
+        let configuration = TextInputConfiguration {
+            purpose: TextInputPurpose::Phone,
+            ..Default::default()
+        };
+        assert_eq!(
+            editor_info(&configuration, KeyboardType::Default).0,
+            TYPE_CLASS_PHONE
+        );
+        assert_eq!(
+            editor_info(&configuration, KeyboardType::NumberPad).0,
+            TYPE_CLASS_NUMBER
+        );
     }
 
     #[test]
