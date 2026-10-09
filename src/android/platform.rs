@@ -66,10 +66,9 @@ use gpui_wgpu::GpuContext;
 
 /// Android clipboard.
 ///
-/// With the `clipboard` feature this goes through the system `ClipboardManager`
-/// (`dev.gpui.mobile.GpuiClipboard`), so text copied in GPUI can be pasted in other
-/// apps and vice versa. Without the feature, or when the JNI call fails (the host did
-/// not package `GpuiClipboard.java`), it falls back to an in-process string store.
+/// With the `clipboard` feature this goes through the system `ClipboardManager`, so
+/// text copied in GPUI can be pasted in other apps and vice versa. Without the
+/// feature, or when the JNI call fails, it falls back to an in-process string store.
 #[derive(Default)]
 pub struct AndroidClipboard {
     contents: Option<String>,
