@@ -53,7 +53,41 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 
-use super::{AndroidKeyEvent, Bounds, DevicePixels, Pixels, Point, Size, TouchPoint};
+use super::{host, AndroidKeyEvent, Bounds, DevicePixels, Pixels, Point, Size, TouchPoint};
+
+/// A touch that ends within this distance of where it started is a tap, not a drag.
+fn is_tap_distance(start: gpui::Point<gpui::Pixels>, end: gpui::Point<gpui::Pixels>) -> bool {
+    const SLOP: f32 = 10.;
+    let (dx, dy) = (f32::from(end.x - start.x), f32::from(end.y - start.y));
+    dx * dx + dy * dy <= SLOP * SLOP
+}
+
+/// Whether `position` is on the row of the focused text input, judged by its caret.
+///
+/// The input handler exposes text geometry, not the field's frame; the caret's line is
+/// a close enough stand-in for a single-line field, and stops a tap anywhere else on
+/// screen from popping the keyboard back up.
+fn tap_hits_focused_input(
+    slot: &Rc<RefCell<Option<PlatformInputHandler>>>,
+    position: gpui::Point<gpui::Pixels>,
+) -> bool {
+    // No RefCell borrow may span the handler's GPUI update; same pattern as `text_input`.
+    let Some(mut handler) = slot.borrow_mut().take() else {
+        return false;
+    };
+    let caret = handler
+        .selected_text_range(false)
+        .and_then(|selection| handler.bounds_for_range(selection.range));
+    let mut current = slot.borrow_mut();
+    if current.is_none() {
+        *current = Some(handler);
+    }
+    const ROW_SLOP: f32 = 16.;
+    caret.is_some_and(|caret| {
+        let y = f32::from(position.y);
+        y >= f32::from(caret.top()) - ROW_SLOP && y <= f32::from(caret.bottom()) + ROW_SLOP
+    })
+}
 
 /// Lightweight, owned window handle for wgpu surface creation.
 /// Stores the raw ANativeWindow pointer and implements the traits
@@ -138,12 +172,44 @@ fn load_set_frame_rate_with_change_strategy() -> Option<SetFrameRateWithChangeSt
     })
 }
 
+/// The device's Android API level.
+///
+/// Deliberately *not* `ndk_sys::android_get_device_api_level()`: that symbol only entered
+/// libc in Android 10 (API 29), and Rust has no equivalent of the NDK C headers'
+/// `__INTRODUCED_IN` guards, so building against a lower platform still emits a **strong**
+/// undefined reference instead of falling back to the inline implementation. The result is
+/// that the whole `.so` fails to `dlopen` on anything below API 29 (reproduced on an
+/// OPPO R11s running Android 8.1) — the very devices the downgrade path below exists for.
+///
+/// Reading `ro.build.version.sdk` is available since API 1 and needs no new symbol.
+fn device_api_level() -> i32 {
+    static LEVEL: OnceLock<i32> = OnceLock::new();
+    *LEVEL.get_or_init(|| {
+        let mut value = [0u8; libc::PROP_VALUE_MAX as usize];
+        let len = unsafe {
+            libc::__system_property_get(
+                b"ro.build.version.sdk\0".as_ptr().cast(),
+                value.as_mut_ptr().cast(),
+            )
+        };
+        if len <= 0 {
+            // Unreadable: report the lowest level so we skip the high-refresh request
+            // rather than wrongly assume support.
+            return 0;
+        }
+        std::str::from_utf8(&value[..len as usize])
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0)
+    })
+}
+
 /// Request 120 Hz refresh rate from the native window when the platform exposes the API.
 ///
 /// The NDK entry points are resolved with `dlsym` so this library still loads
 /// on pre-API-30/31 devices where the symbols do not exist.
 fn request_high_frame_rate(window: &NativeWindow) {
-    let api_level = unsafe { ndk_sys::android_get_device_api_level() };
+    let api_level = device_api_level();
     let native_window = window.ptr().as_ptr();
 
     let status = if api_level >= 31 {
@@ -500,7 +566,12 @@ impl AndroidWindow {
             let config = WgpuSurfaceConfig {
                 size: gpui::size(gpui::DevicePixels(width), gpui::DevicePixels(height)),
                 transparent,
-                preferred_present_mode: Some(wgpu::PresentMode::Mailbox),
+                // `None` keeps the mode negotiated when the renderer was created.
+                // `replace_surface` applies a preferred mode without checking the
+                // surface caps (unlike `WgpuRenderer::new`), and GL only offers
+                // `Fifo`: asking for `Mailbox` here leaves the surface unconfigured
+                // and the next frame panics in `get_current_texture_view`.
+                preferred_present_mode: None,
             };
             let instance = state
                 .gpu_context
@@ -1152,13 +1223,160 @@ impl AndroidWindow {
     ) -> Result<WgpuRenderer> {
         let raw = Self::raw_window(native_window);
 
-        let config = WgpuSurfaceConfig {
+        let config = || WgpuSurfaceConfig {
             size: gpui::size(gpui::DevicePixels(width), gpui::DevicePixels(height)),
             transparent,
             preferred_present_mode: Some(wgpu::PresentMode::Mailbox),
         };
 
-        WgpuRenderer::new(gpu_context, &raw, config, None)
+        if gpu_context.borrow().is_some() {
+            // The shared context already works for this process; just add a surface.
+            return WgpuRenderer::new(gpu_context, &raw, config(), None);
+        }
+
+        // A fresh context. wgpu picks an adapter by creating a device and configuring
+        // a surface, which says nothing about whether the driver can build our
+        // pipelines — and on Android it often cannot: an Adreno 512 (Android 8.1)
+        // loses the Vulkan device while compiling our shaders, and a GL without
+        // unaligned buffer bindings rejects `path_rasterization`. So every attempt
+        // builds the renderer inside an error scope and only counts if nothing failed.
+        if host::gpu_backend() == host::GpuBackend::Gl {
+            // The host remembers this device cannot run our pipelines on Vulkan.
+            let renderer =
+                Self::try_fresh_renderer(&gpu_context, &raw, config(), wgpu::Backends::GL)?;
+            host::report_gpu_outcome(host::GpuOutcome::Gl);
+            return Ok(renderer);
+        }
+
+        match Self::try_fresh_renderer(
+            &gpu_context,
+            &raw,
+            config(),
+            wgpu::Backends::VULKAN | wgpu::Backends::GL,
+        ) {
+            Ok(renderer) => {
+                // Report what wgpu actually picked: devices without Vulkan get GL here.
+                let on_vulkan = gpu_context.borrow().as_ref().is_some_and(|ctx| {
+                    matches!(
+                        ctx.backend(),
+                        gpui_wgpu::WgpuBackend::Native(wgpu::Backend::Vulkan)
+                    )
+                });
+                host::report_gpu_outcome(if on_vulkan {
+                    host::GpuOutcome::Vulkan
+                } else {
+                    host::GpuOutcome::Gl
+                });
+                Ok(renderer)
+            }
+            Err(FreshRendererError {
+                backend: wgpu::Backend::Vulkan,
+                error,
+            }) => {
+                log::warn!(
+                    "AndroidWindow: Vulkan cannot build our pipelines ({error:#}) — retrying on GL"
+                );
+                let renderer =
+                    Self::try_fresh_renderer(&gpu_context, &raw, config(), wgpu::Backends::GL)?;
+                host::report_gpu_outcome(host::GpuOutcome::GlAfterVulkanFailed);
+                Ok(renderer)
+            }
+            // wgpu already chose GL (no usable Vulkan): nothing else to try.
+            Err(err) => Err(err.error),
+        }
+    }
+
+    /// Build a fresh shared context on `backends` and a renderer on it, counting it
+    /// only if nothing failed along the way. On failure the context is dropped again
+    /// — releasing its surface, so another backend can attach to the same window.
+    ///
+    /// The error scope matters: `WgpuRenderer::new` builds its pipelines before it
+    /// installs its own error handler, so a rejected pipeline would otherwise reach
+    /// wgpu's default handler, which panics the render thread.
+    fn try_fresh_renderer(
+        gpu_context: &GpuContext,
+        raw: &RawAndroidWindow,
+        config: WgpuSurfaceConfig,
+        backends: wgpu::Backends,
+    ) -> std::result::Result<WgpuRenderer, FreshRendererError> {
+        let context = Self::create_context(raw, backends).map_err(|error| FreshRendererError {
+            backend: wgpu::Backend::Noop,
+            error,
+        })?;
+        let backend = match context.backend() {
+            gpui_wgpu::WgpuBackend::Native(backend) => backend,
+            _ => wgpu::Backend::Gl,
+        };
+        let device = Arc::clone(&context.device);
+        *gpu_context.borrow_mut() = Some(context);
+
+        let scopes = [
+            device.push_error_scope(wgpu::ErrorFilter::Validation),
+            device.push_error_scope(wgpu::ErrorFilter::OutOfMemory),
+            device.push_error_scope(wgpu::ErrorFilter::Internal),
+        ];
+        let renderer = WgpuRenderer::new(Rc::clone(gpu_context), raw, config, None);
+        let mut scope_error = None;
+        for scope in scopes.into_iter().rev() {
+            if let Some(error) = gpui::block_on(scope.pop()) {
+                scope_error.get_or_insert(error);
+            }
+        }
+        let lost = gpu_context
+            .borrow()
+            .as_ref()
+            .is_some_and(|ctx| ctx.device_lost());
+
+        let failure = match (renderer, scope_error, lost) {
+            (Ok(renderer), None, false) => return Ok(renderer),
+            (Err(error), _, _) => error,
+            (Ok(_), Some(error), _) => anyhow::anyhow!("{error}"),
+            (Ok(_), None, true) => anyhow::anyhow!("GPU device lost while building pipelines"),
+        };
+        // The failed renderer is already dropped above; drop the context with it.
+        *gpu_context.borrow_mut() = None;
+        Err(FreshRendererError {
+            backend,
+            error: failure,
+        })
+    }
+
+    /// A `WgpuContext` restricted to `backends`, probed against `raw`.
+    fn create_context(
+        raw: &RawAndroidWindow,
+        backends: wgpu::Backends,
+    ) -> Result<gpui_wgpu::WgpuContext> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends,
+            flags: wgpu::InstanceFlags::default(),
+            backend_options: wgpu::BackendOptions::default(),
+            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+            display: Some(Box::new(raw.clone())),
+        });
+        let target = wgpu::SurfaceTargetUnsafe::RawHandle {
+            raw_display_handle: None,
+            raw_window_handle: raw
+                .window_handle()
+                .map_err(|e| anyhow::anyhow!("window handle unavailable: {e}"))?
+                .as_raw(),
+        };
+        // SAFETY: the native window outlives this probe surface. Dropping it
+        // releases the window before the renderer creates its own surface.
+        let surface = unsafe { instance.create_surface_unsafe(target) }
+            .context("failed to create a probe surface")?;
+        gpui_wgpu::WgpuContext::new(instance, &surface, None)
+    }
+}
+
+/// Why [`AndroidWindow::try_fresh_renderer`] failed, and on which backend.
+struct FreshRendererError {
+    backend: wgpu::Backend,
+    error: anyhow::Error,
+}
+
+impl From<FreshRendererError> for anyhow::Error {
+    fn from(err: FreshRendererError) -> Self {
+        err.error
     }
 }
 
@@ -1422,18 +1640,44 @@ impl PlatformWindow for AndroidPlatformWindow {
     fn on_input(&self, callback: Box<dyn FnMut(gpui::PlatformInput) -> DispatchEventResult>) {
         let input_handler = Rc::clone(&self.input_handler);
         let mut callback = callback;
-        let callback: Box<dyn FnMut(gpui::PlatformInput) -> DispatchEventResult> = Box::new(
-            move |event| {
-                if matches!(&event, gpui::PlatformInput::Touch(touch) if touch.phase == gpui::TouchPhase::Started)
-                {
-                    // Apply any last IME update to the old input before a tap can
-                    // change focus. A new native session rejects late IME callbacks.
-                    super::text_input::drain(&input_handler, &mut callback);
-                    super::text_input::finish_composition(&input_handler);
+        // Where the current single-finger touch started, to tell a tap from a drag.
+        let mut tap_start: Option<(gpui::TouchId, gpui::Point<gpui::Pixels>)> = None;
+        let callback: Box<dyn FnMut(gpui::PlatformInput) -> DispatchEventResult> =
+            Box::new(move |event| {
+                if let gpui::PlatformInput::Touch(touch) = &event {
+                    match touch.phase {
+                        gpui::TouchPhase::Started => {
+                            // Apply any last IME update to the old input before a tap can
+                            // change focus. A new native session rejects late IME callbacks.
+                            super::text_input::drain(&input_handler, &mut callback);
+                            super::text_input::finish_composition(&input_handler);
+                            tap_start = Some((touch.id, touch.position));
+                        }
+                        gpui::TouchPhase::Moved => {
+                            if tap_start.is_some_and(|(id, start)| {
+                                id == touch.id && !is_tap_distance(start, touch.position)
+                            }) {
+                                tap_start = None;
+                            }
+                        }
+                        gpui::TouchPhase::Ended => {
+                            // The user hid the keyboard with back while the field kept
+                            // focus (see `jni::keyboard_hidden_by_user`): tapping that
+                            // field again must bring the keyboard back, as on a native
+                            // EditText. Checked before GPUI handles the tap, against the
+                            // input that is focused now.
+                            if tap_start.take().is_some_and(|(id, _)| id == touch.id)
+                                && super::jni::keyboard_dismissed()
+                                && tap_hits_focused_input(&input_handler, touch.position)
+                            {
+                                super::jni::reshow_dismissed_keyboard();
+                            }
+                        }
+                        gpui::TouchPhase::Cancelled => tap_start = None,
+                    }
                 }
                 callback(event)
-            },
-        );
+            });
         // Bridge AndroidWindow touch/key callbacks → gpui::PlatformInput.
         //
         // PlatformWindow gives us Box<dyn FnMut(...)> (not Send).
