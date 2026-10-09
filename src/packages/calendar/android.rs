@@ -1,5 +1,5 @@
 use super::{Calendar, CalendarEvent};
-use crate::android::jni::{self as jni_helpers, get_string, JniExt};
+use crate::android::jni::{self as jni_helpers, get_string, JniExt, JniResultExt as _};
 use jni::objects::JValue;
 
 const HELPER_CLASS: &str = "dev.gpui.mobile.GpuiCalendar";
@@ -17,10 +17,7 @@ pub fn get_calendars() -> Result<Vec<Calendar>, String> {
                 &[JValue::Object(&activity)],
             )
             .and_then(|v| v.l())
-            .map_err(|e| {
-                env.exception_clear();
-                e.to_string()
-            })?;
+            .or_clear(env)?;
 
         if result.is_null() {
             return Ok(vec![]);
@@ -77,10 +74,7 @@ pub fn get_events(
                 ],
             )
             .and_then(|v| v.l())
-            .map_err(|e| {
-                env.exception_clear();
-                e.to_string()
-            })?;
+            .or_clear(env)?;
 
         if result.is_null() {
             return Ok(vec![]);
@@ -150,11 +144,7 @@ pub fn create_event(event: &CalendarEvent) -> Result<String, String> {
                     JValue::Bool(all_day),
                 ],
             )
-            .and_then(|v| v.l())
-            .map_err(|e| {
-                env.exception_clear();
-                e.to_string()
-            })?;
+            .and_then(|v| v.l()).or_clear(env)?;
 
         if result.is_null() {
             return Err("Failed to create event".into());
@@ -185,10 +175,7 @@ pub fn delete_event(event_id: &str) -> Result<bool, String> {
                 &[JValue::Object(&activity), JValue::Object(&j_event_id)],
             )
             .and_then(|v| v.z())
-            .map_err(|e| {
-                env.exception_clear();
-                e.to_string()
-            })?;
+            .or_clear(env)?;
 
         Ok(result)
     })

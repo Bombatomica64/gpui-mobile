@@ -1,5 +1,5 @@
 use super::PackageInfo;
-use crate::android::jni::{self as jni_helpers, get_string, JniExt};
+use crate::android::jni::{self as jni_helpers, get_string, JniExt, JniResultExt as _};
 use jni::objects::JValue;
 
 pub fn get_package_info() -> Result<PackageInfo, String> {
@@ -15,7 +15,7 @@ pub fn get_package_info() -> Result<PackageInfo, String> {
                 &[],
             )
             .and_then(|v| v.l())
-            .e()?;
+            .or_clear(env)?;
         let package_name = get_string(env, &pkg_name_obj);
 
         // activity.getPackageManager() → PackageManager
@@ -27,7 +27,7 @@ pub fn get_package_info() -> Result<PackageInfo, String> {
                 &[],
             )
             .and_then(|v| v.l())
-            .e()?;
+            .or_clear(env)?;
         if pm.is_null() {
             return Err("getPackageManager returned null".into());
         }
@@ -42,7 +42,7 @@ pub fn get_package_info() -> Result<PackageInfo, String> {
                 &[JValue::Object(&jpkg), JValue::Int(0)],
             )
             .and_then(|v| v.l())
-            .e()?;
+            .or_clear(env)?;
         if pkg_info.is_null() {
             return Err("getPackageInfo returned null".into());
         }
@@ -84,6 +84,7 @@ pub fn get_package_info() -> Result<PackageInfo, String> {
                     jni::jni_sig!("Landroid/content/pm/ApplicationInfo;"),
                 )
                 .and_then(|v| v.l())
+                .or_clear(env)
                 .ok()?;
             if app_info.is_null() {
                 return None;
@@ -96,6 +97,7 @@ pub fn get_package_info() -> Result<PackageInfo, String> {
                     &[JValue::Object(&app_info)],
                 )
                 .and_then(|v| v.l())
+                .or_clear(env)
                 .ok()?;
             if cs.is_null() {
                 return None;
@@ -108,6 +110,7 @@ pub fn get_package_info() -> Result<PackageInfo, String> {
                     &[],
                 )
                 .and_then(|v| v.l())
+                .or_clear(env)
                 .ok()?;
             Some(get_string(env, &label))
         })()

@@ -1,5 +1,5 @@
 use super::*;
-use crate::android::jni::{self as jni_helpers, JniExt};
+use crate::android::jni::{self as jni_helpers, JniExt, JniResultExt as _};
 use jni::objects::JValue;
 
 const HELPER_CLASS: &str = "dev.gpui.mobile.GpuiPermissions";
@@ -51,10 +51,7 @@ pub fn check_permission(permission: Permission) -> Result<PermissionStatus, Stri
                 &[JValue::Object(&activity), JValue::Object(&j_perm)],
             )
             .and_then(|v| v.i())
-            .map_err(|e| {
-                env.exception_clear();
-                e.to_string()
-            })?;
+            .or_clear(env)?;
 
         Ok(int_to_status(status))
     })
@@ -79,10 +76,7 @@ pub fn request_permission(permission: Permission) -> Result<PermissionStatus, St
                 &[JValue::Object(&activity), JValue::Object(&j_perm)],
             )
             .and_then(|v| v.i())
-            .map_err(|e| {
-                env.exception_clear();
-                e.to_string()
-            })?;
+            .or_clear(env)?;
 
         Ok(int_to_status(status))
     })
@@ -112,10 +106,7 @@ pub fn request_permissions(
                 &[JValue::Object(&activity), JValue::Object(&j_perms)],
             )
             .and_then(|v| v.l())
-            .map_err(|e| {
-                env.exception_clear();
-                e.to_string()
-            })?;
+            .or_clear(env)?;
 
         if result.is_null() {
             // Fallback: request one by one
@@ -163,10 +154,7 @@ pub fn service_status(permission: Permission) -> Result<ServiceStatus, String> {
                 &[JValue::Object(&activity), JValue::Int(service_type)],
             )
             .and_then(|v| v.z())
-            .map_err(|e| {
-                env.exception_clear();
-                e.to_string()
-            })?;
+            .or_clear(env)?;
 
         Ok(if enabled {
             ServiceStatus::Enabled
@@ -189,10 +177,7 @@ pub fn open_app_settings() -> Result<bool, String> {
                 &[JValue::Object(&activity)],
             )
             .and_then(|v| v.z())
-            .map_err(|e| {
-                env.exception_clear();
-                e.to_string()
-            })?;
+            .or_clear(env)?;
 
         Ok(result)
     })
@@ -217,10 +202,7 @@ pub fn should_show_request_rationale(permission: Permission) -> Result<bool, Str
                 &[JValue::Object(&activity), JValue::Object(&j_perm)],
             )
             .and_then(|v| v.z())
-            .map_err(|e| {
-                env.exception_clear();
-                e.to_string()
-            })?;
+            .or_clear(env)?;
 
         Ok(result)
     })

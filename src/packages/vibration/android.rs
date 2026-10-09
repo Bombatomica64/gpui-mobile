@@ -1,5 +1,5 @@
 use super::HapticFeedback;
-use crate::android::jni::{self as jni_helpers, JniExt};
+use crate::android::jni::{self as jni_helpers, JniExt, JniResultExt as _};
 use jni::objects::{JObject, JValue};
 
 pub fn vibrate(duration_ms: u32) -> Result<(), String> {
@@ -69,7 +69,7 @@ pub fn haptic_feedback(feedback: HapticFeedback) -> Result<(), String> {
                 &[],
             )
             .and_then(|v| v.l())
-            .e()?;
+            .or_clear(env)?;
         if window.is_null() {
             return Err("getWindow returned null".into());
         }
@@ -82,7 +82,7 @@ pub fn haptic_feedback(feedback: HapticFeedback) -> Result<(), String> {
                 &[],
             )
             .and_then(|v| v.l())
-            .e()?;
+            .or_clear(env)?;
         if decor.is_null() {
             return Err("getDecorView returned null".into());
         }
@@ -112,6 +112,7 @@ pub fn can_vibrate() -> bool {
                 &[],
             )
             .and_then(|v| v.z())
+            .or_clear(env)
             .unwrap_or(false);
         Ok(result)
     })
@@ -131,7 +132,7 @@ fn get_vibrator_service<'local>(
             &[JValue::Object(&service_name)],
         )
         .and_then(|v| v.l())
-        .e()?;
+        .or_clear(env)?;
     if vibrator.is_null() {
         return Err("Vibrator service not available".into());
     }

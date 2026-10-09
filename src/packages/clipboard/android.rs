@@ -1,4 +1,4 @@
-use crate::android::jni::{self as jni_helpers, get_string, JniExt};
+use crate::android::jni::{self as jni_helpers, get_string, JniExt, JniResultExt as _};
 use jni::objects::JValue;
 
 const HELPER_CLASS: &str = "dev.gpui.mobile.GpuiClipboard";
@@ -17,10 +17,7 @@ pub fn set_text(text: &str) -> Result<(), String> {
             jni::jni_sig!("(Landroid/app/Activity;Ljava/lang/String;)V"),
             &[JValue::Object(&activity), JValue::Object(&j_text)],
         )
-        .map_err(|e| {
-            env.exception_clear();
-            e.to_string()
-        })?;
+        .or_clear(env)?;
 
         Ok(())
     })
@@ -39,10 +36,7 @@ pub fn get_text() -> Result<Option<String>, String> {
                 &[JValue::Object(&activity)],
             )
             .and_then(|v| v.l())
-            .map_err(|e| {
-                env.exception_clear();
-                e.to_string()
-            })?;
+            .or_clear(env)?;
 
         if result.is_null() {
             return Ok(None);
@@ -70,10 +64,7 @@ pub fn has_text() -> Result<bool, String> {
                 &[JValue::Object(&activity)],
             )
             .and_then(|v| v.z())
-            .map_err(|e| {
-                env.exception_clear();
-                e.to_string()
-            })?;
+            .or_clear(env)?;
 
         Ok(result)
     })

@@ -1,4 +1,4 @@
-use crate::android::jni::{self as jni_helpers, JniExt};
+use crate::android::jni::{self as jni_helpers, JniExt, JniResultExt as _};
 use jni::objects::JValue;
 
 pub fn launch_url(url: &str) -> Result<bool, String> {
@@ -41,7 +41,7 @@ pub fn can_launch_url(url: &str) -> Result<bool, String> {
                 &[],
             )
             .and_then(|v| v.l())
-            .e()?;
+            .or_clear(env)?;
         if pm.is_null() {
             return Err("getPackageManager returned null".into());
         }
@@ -81,7 +81,7 @@ fn create_view_intent<'local>(
             &[JValue::Object(&jurl)],
         )
         .and_then(|v| v.l())
-        .e()?;
+        .or_clear(env)?;
     if uri.is_null() {
         return Err(format!("Uri.parse returned null for: {url}"));
     }
@@ -94,7 +94,7 @@ fn create_view_intent<'local>(
             jni::jni_sig!("(Ljava/lang/String;Landroid/net/Uri;)V"),
             &[JValue::Object(&action_view), JValue::Object(&uri)],
         )
-        .e()?;
+        .or_clear(env)?;
 
     Ok(intent)
 }

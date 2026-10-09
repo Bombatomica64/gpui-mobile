@@ -1,5 +1,5 @@
 use super::WebViewHandle;
-use crate::android::jni::{self as jni_helpers, JniExt};
+use crate::android::jni::{self as jni_helpers, JniExt, JniResultExt as _};
 use jni::objects::JValue;
 
 const HELPER_CLASS: &str = "dev.gpui.mobile.GpuiHelper";
@@ -17,10 +17,7 @@ pub fn evaluate_javascript(handle: &WebViewHandle, script: &str) -> Result<(), S
             jni::jni_sig!("(Ljava/lang/String;)V"),
             &[JValue::Object(&jscript)],
         )
-        .map_err(|e| {
-            env.exception_clear();
-            e.to_string()
-        })?;
+        .or_clear(env)?;
         Ok(())
     })
 }
@@ -32,10 +29,7 @@ pub fn go_back(handle: &WebViewHandle) -> Result<(), String> {
     jni_helpers::with_env(|env| {
         let cls = jni_helpers::find_app_class(env, HELPER_CLASS)?;
         env.call_static_method(&cls, jni::jni_str!("goBack"), jni::jni_sig!("()V"), &[])
-            .map_err(|e| {
-                env.exception_clear();
-                e.to_string()
-            })?;
+            .or_clear(env)?;
         Ok(())
     })
 }
@@ -47,10 +41,7 @@ pub fn reload(handle: &WebViewHandle) -> Result<(), String> {
     jni_helpers::with_env(|env| {
         let cls = jni_helpers::find_app_class(env, HELPER_CLASS)?;
         env.call_static_method(&cls, jni::jni_str!("reload"), jni::jni_sig!("()V"), &[])
-            .map_err(|e| {
-                env.exception_clear();
-                e.to_string()
-            })?;
+            .or_clear(env)?;
         Ok(())
     })
 }
@@ -67,10 +58,7 @@ pub fn stop_loading(handle: &WebViewHandle) -> Result<(), String> {
             jni::jni_sig!("()V"),
             &[],
         )
-        .map_err(|e| {
-            env.exception_clear();
-            e.to_string()
-        })?;
+        .or_clear(env)?;
         Ok(())
     })
 }

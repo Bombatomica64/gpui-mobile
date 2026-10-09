@@ -1,4 +1,4 @@
-use crate::android::jni::{self as jni_helpers, JniExt};
+use crate::android::jni::{self as jni_helpers, JniExt, JniResultExt as _};
 use jni::objects::JValue;
 
 pub fn open_coordinates(
@@ -98,7 +98,7 @@ pub fn open_directions(
                 jni::jni_sig!("(Ljava/lang/String;)Landroid/content/Intent;"),
                 &[JValue::Object(&pkg)],
             )
-            .e()?;
+            .or_clear(env)?;
 
         match env.call_method(
             &activity,
@@ -149,7 +149,7 @@ pub fn is_available() -> Result<bool, String> {
                 &[],
             )
             .and_then(|v| v.l())
-            .e()?;
+            .or_clear(env)?;
         if pm.is_null() {
             return Err("getPackageManager returned null".into());
         }
@@ -188,7 +188,7 @@ fn create_geo_intent<'local>(
             &[JValue::Object(&jurl)],
         )
         .and_then(|v| v.l())
-        .e()?;
+        .or_clear(env)?;
     if uri.is_null() {
         return Err(format!("Uri.parse returned null for: {uri_str}"));
     }
@@ -200,7 +200,7 @@ fn create_geo_intent<'local>(
             jni::jni_sig!("(Ljava/lang/String;Landroid/net/Uri;)V"),
             &[JValue::Object(&action_view), JValue::Object(&uri)],
         )
-        .e()?;
+        .or_clear(env)?;
 
     Ok(intent)
 }
@@ -218,7 +218,7 @@ fn add_new_task_flag(
             jni::jni_sig!("(I)Landroid/content/Intent;"),
             &[JValue::Int(0x10000000)],
         )
-        .e()?;
+        .or_clear(env)?;
     Ok(())
 }
 

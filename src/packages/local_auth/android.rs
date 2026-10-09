@@ -1,5 +1,5 @@
 use super::{AuthResult, BiometricType};
-use crate::android::jni::{self as jni_helpers, JniExt};
+use crate::android::jni::{self as jni_helpers, JniExt, JniResultExt as _};
 use jni::objects::JValue;
 
 const HELPER_CLASS: &str = "dev.gpui.mobile.GpuiLocalAuth";
@@ -17,10 +17,7 @@ pub fn is_device_supported() -> Result<bool, String> {
                 &[JValue::Object(&activity)],
             )
             .and_then(|v| v.z())
-            .map_err(|e| {
-                env.exception_clear();
-                e.to_string()
-            })?;
+            .or_clear(env)?;
 
         Ok(result)
     })
@@ -39,10 +36,7 @@ pub fn can_authenticate() -> Result<bool, String> {
                 &[JValue::Object(&activity)],
             )
             .and_then(|v| v.z())
-            .map_err(|e| {
-                env.exception_clear();
-                e.to_string()
-            })?;
+            .or_clear(env)?;
 
         Ok(result)
     })
@@ -61,10 +55,7 @@ pub fn get_available_biometrics() -> Result<Vec<BiometricType>, String> {
                 &[JValue::Object(&activity)],
             )
             .and_then(|v| v.l())
-            .map_err(|e| {
-                env.exception_clear();
-                e.to_string()
-            })?;
+            .or_clear(env)?;
 
         if result.is_null() {
             return Ok(vec![]);
@@ -100,10 +91,7 @@ pub fn authenticate(reason: &str) -> Result<AuthResult, String> {
                 &[JValue::Object(&activity), JValue::Object(&j_reason)],
             )
             .and_then(|v| v.i())
-            .map_err(|e| {
-                env.exception_clear();
-                e.to_string()
-            })?;
+            .or_clear(env)?;
 
         Ok(int_to_auth_result(result))
     })

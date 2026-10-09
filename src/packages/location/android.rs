@@ -1,5 +1,5 @@
 use super::{LocationAccuracy, LocationSettings, Position};
-use crate::android::jni::{self as jni_helpers};
+use crate::android::jni::{self as jni_helpers, JniResultExt as _};
 use jni::objects::JValue;
 
 const HELPER_CLASS: &str = "dev.gpui.mobile.GpuiLocation";
@@ -17,10 +17,7 @@ pub fn is_location_service_enabled() -> Result<bool, String> {
                 &[JValue::Object(&activity)],
             )
             .and_then(|v| v.z())
-            .map_err(|e| {
-                env.exception_clear();
-                e.to_string()
-            })?;
+            .or_clear(env)?;
 
         Ok(result)
     })
@@ -41,10 +38,7 @@ pub fn get_current_position(settings: &LocationSettings) -> Result<Position, Str
                 &[JValue::Object(&activity), JValue::Int(accuracy_int)],
             )
             .and_then(|v| v.l())
-            .map_err(|e| {
-                env.exception_clear();
-                e.to_string()
-            })?;
+            .or_clear(env)?;
 
         if result.is_null() {
             return Err("Failed to get current position".into());
@@ -68,10 +62,7 @@ pub fn get_last_known_position() -> Result<Option<Position>, String> {
                 &[JValue::Object(&activity)],
             )
             .and_then(|v| v.l())
-            .map_err(|e| {
-                env.exception_clear();
-                e.to_string()
-            })?;
+            .or_clear(env)?;
 
         if result.is_null() {
             return Ok(None);

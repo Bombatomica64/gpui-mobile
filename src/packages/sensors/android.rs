@@ -1,5 +1,5 @@
 use super::{BarometerData, SensorAvailability, SensorData};
-use crate::android::jni as jni_helpers;
+use crate::android::jni::{self as jni_helpers, JniResultExt as _};
 use jni::objects::JValue;
 
 // Android Sensor.TYPE_* constants
@@ -61,6 +61,7 @@ fn get_sensor_manager<'local>(
             &[JValue::Object(&service_name)],
         )
         .and_then(|v| v.l())
+        .or_clear(env)
         .ok()?;
     if sm.is_null() {
         env.exception_clear();

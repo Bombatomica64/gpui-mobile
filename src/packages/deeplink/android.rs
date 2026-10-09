@@ -1,4 +1,4 @@
-use crate::android::jni::{self as jni_helpers, get_string};
+use crate::android::jni::{self as jni_helpers, get_string, JniResultExt as _};
 use jni::objects::JValue;
 use std::sync::Mutex;
 
@@ -19,10 +19,7 @@ pub fn get_initial_link() -> Result<Option<String>, String> {
                 &[JValue::Object(&activity)],
             )
             .and_then(|v| v.l())
-            .map_err(|e| {
-                env.exception_clear();
-                e.to_string()
-            })?;
+            .or_clear(env)?;
 
         if result.is_null() {
             return Ok(None);

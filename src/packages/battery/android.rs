@@ -1,5 +1,5 @@
 use super::BatteryState;
-use crate::android::jni as jni_helpers;
+use crate::android::jni::{self as jni_helpers, JniResultExt as _};
 use jni::objects::JValue;
 
 /// Android BatteryManager.EXTRA_* constants.
@@ -89,8 +89,7 @@ fn read_battery_sticky() -> Option<(i32, i32, i32)> {
                 jni::jni_str!("android/content/IntentFilter"),
                 jni::jni_sig!("(Ljava/lang/String;)V"),
                 &[JValue::Object(&action)],
-            )
-            .map_err(|e| e.to_string())?;
+            ).or_clear(env)?;
 
         // Intent batteryStatus = context.registerReceiver(null, filter);
         let battery_intent = env
@@ -100,8 +99,7 @@ fn read_battery_sticky() -> Option<(i32, i32, i32)> {
                 jni::jni_sig!("(Landroid/content/BroadcastReceiver;Landroid/content/IntentFilter;)Landroid/content/Intent;"),
                 &[JValue::Object(&jni::objects::JObject::null()), JValue::Object(&filter)],
             )
-            .and_then(|v| v.l())
-            .map_err(|e| e.to_string())?;
+            .and_then(|v| v.l()).or_clear(env)?;
         if battery_intent.is_null() {
             return Err("battery intent is null".into());
         }
@@ -115,8 +113,7 @@ fn read_battery_sticky() -> Option<(i32, i32, i32)> {
                 jni::jni_sig!("(Ljava/lang/String;I)I"),
                 &[JValue::Object(&key_level), JValue::Int(-1)],
             )
-            .and_then(|v| v.i())
-            .map_err(|e| e.to_string())?;
+            .and_then(|v| v.i()).or_clear(env)?;
 
         // int scale = intent.getIntExtra("scale", -1);
         let key_scale = env.new_string("scale").map_err(|e| e.to_string())?;
@@ -127,8 +124,7 @@ fn read_battery_sticky() -> Option<(i32, i32, i32)> {
                 jni::jni_sig!("(Ljava/lang/String;I)I"),
                 &[JValue::Object(&key_scale), JValue::Int(-1)],
             )
-            .and_then(|v| v.i())
-            .map_err(|e| e.to_string())?;
+            .and_then(|v| v.i()).or_clear(env)?;
 
         // int status = intent.getIntExtra("status", -1);
         let key_status = env.new_string("status").map_err(|e| e.to_string())?;
@@ -139,8 +135,7 @@ fn read_battery_sticky() -> Option<(i32, i32, i32)> {
                 jni::jni_sig!("(Ljava/lang/String;I)I"),
                 &[JValue::Object(&key_status), JValue::Int(-1)],
             )
-            .and_then(|v| v.i())
-            .map_err(|e| e.to_string())?;
+            .and_then(|v| v.i()).or_clear(env)?;
 
         Ok(Some((level, scale, status)))
     })

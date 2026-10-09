@@ -1,4 +1,4 @@
-use crate::android::jni::{self as jni_helpers, JniExt};
+use crate::android::jni::{self as jni_helpers, JniExt, JniResultExt as _};
 use jni::objects::JValue;
 
 pub fn share_text(text: &str, subject: Option<&str>) -> Result<(), String> {
@@ -15,7 +15,7 @@ pub fn share_text(text: &str, subject: Option<&str>) -> Result<(), String> {
                 jni::jni_sig!("(Ljava/lang/String;)V"),
                 &[JValue::Object(&action_send)],
             )
-            .e()?;
+            .or_clear(env)?;
 
         // intent.setType("text/plain")
         let mime = env.new_string("text/plain").e()?;
@@ -26,7 +26,7 @@ pub fn share_text(text: &str, subject: Option<&str>) -> Result<(), String> {
                 jni::jni_sig!("(Ljava/lang/String;)Landroid/content/Intent;"),
                 &[JValue::Object(&mime)],
             )
-            .e()?;
+            .or_clear(env)?;
 
         // intent.putExtra(Intent.EXTRA_TEXT, text)
         let extra_text_key = env.new_string("android.intent.extra.TEXT").e()?;
@@ -41,7 +41,7 @@ pub fn share_text(text: &str, subject: Option<&str>) -> Result<(), String> {
                     JValue::Object(&extra_text_val),
                 ],
             )
-            .e()?;
+            .or_clear(env)?;
 
         // intent.putExtra(Intent.EXTRA_SUBJECT, subject) if provided
         if let Some(ref subj) = subject {
@@ -57,7 +57,7 @@ pub fn share_text(text: &str, subject: Option<&str>) -> Result<(), String> {
                         JValue::Object(&extra_subj_val),
                     ],
                 )
-                .e()?;
+                .or_clear(env)?;
         }
 
         // Intent chooser = Intent.createChooser(intent, "Share")
@@ -75,7 +75,7 @@ pub fn share_text(text: &str, subject: Option<&str>) -> Result<(), String> {
                 &[JValue::Object(&intent), JValue::Object(&chooser_title)],
             )
             .and_then(|v| v.l())
-            .e()?;
+            .or_clear(env)?;
 
         // activity.startActivity(chooser)
         let result = env.call_method(

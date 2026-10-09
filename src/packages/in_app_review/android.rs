@@ -1,4 +1,4 @@
-use crate::android::jni::{self as jni_helpers, JniExt};
+use crate::android::jni::{self as jni_helpers, JniExt, JniResultExt as _};
 use jni::objects::JValue;
 
 const HELPER_CLASS: &str = "dev.gpui.mobile.GpuiInAppReview";
@@ -15,7 +15,7 @@ pub fn is_available() -> Result<bool, String> {
                 &[JValue::Object(&activity)],
             )
             .and_then(|v| v.z())
-            .e()?;
+            .or_clear(env)?;
 
         Ok(result)
     })
@@ -33,7 +33,7 @@ pub fn request_review() -> Result<(), String> {
                 &[JValue::Object(&activity)],
             )
             .and_then(|v| v.z())
-            .e()?;
+            .or_clear(env)?;
 
         if success {
             Ok(())
@@ -56,7 +56,7 @@ pub fn open_store_listing(app_id: &str) -> Result<(), String> {
                 &[JValue::Object(&activity), JValue::Object(&j_app_id)],
             )
             .and_then(|v| v.z())
-            .e()?;
+            .or_clear(env)?;
 
         if success {
             Ok(())

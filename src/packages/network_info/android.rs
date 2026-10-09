@@ -1,5 +1,5 @@
 use super::NetworkInfo;
-use crate::android::jni::{self as jni_helpers, get_string};
+use crate::android::jni::{self as jni_helpers, get_string, JniResultExt as _};
 use jni::objects::JValue;
 
 pub fn get_network_info() -> Result<NetworkInfo, String> {
@@ -51,6 +51,7 @@ pub fn get_network_info() -> Result<NetworkInfo, String> {
                 &[],
             )
             .and_then(|v| v.l())
+            .or_clear(env)
         {
             let ssid = get_string(env, &ssid_obj);
             let ssid = ssid.trim_matches('"').to_string();
@@ -68,6 +69,7 @@ pub fn get_network_info() -> Result<NetworkInfo, String> {
                 &[],
             )
             .and_then(|v| v.l())
+            .or_clear(env)
         {
             let bssid = get_string(env, &bssid_obj);
             if !bssid.is_empty() && bssid != "02:00:00:00:00:00" {
@@ -84,6 +86,7 @@ pub fn get_network_info() -> Result<NetworkInfo, String> {
                 &[],
             )
             .and_then(|v| v.i())
+            .or_clear(env)
         {
             if ip != 0 {
                 info.wifi_ip = Some(format!(

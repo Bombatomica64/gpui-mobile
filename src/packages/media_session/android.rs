@@ -1,4 +1,4 @@
-use crate::android::jni::{self as jni_helpers, JniExt};
+use crate::android::jni::{self as jni_helpers, JniExt, JniResultExt as _};
 use jni::objects::JValue;
 
 const HELPER_CLASS: &str = "dev.gpui.mobile.GpuiMediaSession";
@@ -14,10 +14,7 @@ pub fn init() -> Result<(), String> {
             jni::jni_sig!("(Landroid/app/Activity;)V"),
             &[JValue::Object(&activity)],
         )
-        .map_err(|e| {
-            env.exception_clear();
-            e.to_string()
-        })?;
+        .or_clear(env)?;
 
         Ok(())
     })
@@ -39,10 +36,7 @@ pub fn set_metadata(title: &str, artist: &str, duration_ms: u64) -> Result<(), S
                 JValue::Long(duration_ms as i64),
             ],
         )
-        .map_err(|e| {
-            env.exception_clear();
-            e.to_string()
-        })?;
+        .or_clear(env)?;
 
         Ok(())
     })
@@ -62,10 +56,7 @@ pub fn set_playback_state(is_playing: bool, position_ms: u64, speed: f32) -> Res
                 JValue::Float(speed),
             ],
         )
-        .map_err(|e| {
-            env.exception_clear();
-            e.to_string()
-        })?;
+        .or_clear(env)?;
 
         Ok(())
     })
@@ -76,10 +67,7 @@ pub fn release() -> Result<(), String> {
         let cls = jni_helpers::find_app_class(env, HELPER_CLASS)?;
 
         env.call_static_method(&cls, jni::jni_str!("release"), jni::jni_sig!("()V"), &[])
-            .map_err(|e| {
-                env.exception_clear();
-                e.to_string()
-            })?;
+            .or_clear(env)?;
 
         Ok(())
     })

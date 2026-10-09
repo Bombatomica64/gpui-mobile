@@ -1,5 +1,5 @@
 use super::{CameraDevice, ImagePickerOptions, ImageSource, PickedFile};
-use crate::android::jni::{self as jni_helpers, JniExt};
+use crate::android::jni::{self as jni_helpers, JniExt, JniResultExt as _};
 use jni::objects::{JObject, JValue};
 
 const HELPER_CLASS: &str = "dev.gpui.mobile.GpuiImagePicker";
@@ -30,10 +30,7 @@ pub fn pick_image(options: &ImagePickerOptions) -> Result<Option<PickedFile>, St
                 ],
             )
             .and_then(|v| v.l())
-            .map_err(|e| {
-                env.exception_clear();
-                e.to_string()
-            })?;
+            .or_clear(env)?;
 
         if result.is_null() {
             return Ok(None);
@@ -62,10 +59,7 @@ pub fn pick_multi_image(
                 &[JValue::Object(&activity)],
             )
             .and_then(|v| v.l())
-            .map_err(|e| {
-                env.exception_clear();
-                e.to_string()
-            })?;
+            .or_clear(env)?;
 
         if result.is_null() {
             return Ok(vec![]);
@@ -113,10 +107,7 @@ pub fn pick_video(
                 ],
             )
             .and_then(|v| v.l())
-            .map_err(|e| {
-                env.exception_clear();
-                e.to_string()
-            })?;
+            .or_clear(env)?;
 
         if result.is_null() {
             return Ok(None);
