@@ -73,3 +73,7 @@ fn to_string(env: &mut jni::Env<'_>, object: &JObject<'_>) -> Result<String, Str
 pub fn get_latest_link() -> Option<String> {
     LATEST_LINK.lock().unwrap().clone()
 }
+
+pub(super) fn set_latest_link(url: &str) {
+    *LATEST_LINK.lock().unwrap() = Some(url.to_owned());
+}
