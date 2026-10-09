@@ -261,38 +261,74 @@ pub(crate) fn take_exception(env: &mut jni::Env<'_>) -> Option<String> {
     }
 }
 
-/// Find an application class by name using the Activity's classloader.
+/// Find an application class by name, through the app's class loader.
 ///
-/// From native threads, `JNIEnv::FindClass` uses the system classloader
-/// which doesn't know about application classes.  This helper uses the
-/// Activity's classloader via `activity.getClass().getClassLoader().loadClass(name)`.
+/// From native threads, `JNIEnv::FindClass` uses the system class loader, which
+/// doesn't know about application classes. This helper asks the application
+/// context's class loader instead. The loader and every class found are cached for
+/// the life of the process, so repeated lookups cost one JNI call.
 ///
 /// `class_name` uses Java dot notation (e.g. `"dev.gpui.mobile.GpuiHelper"`).
 pub fn find_app_class<'local>(
     env: &mut jni::Env<'local>,
     class_name: &str,
 ) -> Result<jni::objects::JClass<'local>, String> {
-    let act = activity(env)?;
+    let classes = APP_CLASSES.get_or_init(Default::default);
+    let cached = classes
+        .lock()
+        .expect("poisoned")
+        .get(class_name)
+        .map(|class| env.new_local_ref(class).e());
+    let class = match cached {
+        Some(class) => class?,
+        None => {
+            let class = load_app_class(env, class_name)?;
+            let global = env.new_global_ref(&class).e()?;
+            classes
+                .lock()
+                .expect("poisoned")
+                .insert(class_name.to_owned(), global);
+            class
+        }
+    };
+    // SAFETY: `class` is a local reference to a `java.lang.Class` in this frame.
+    Ok(unsafe { jni::objects::JClass::from_raw(env, class.into_raw()) })
+}
 
-    // activity.getClassLoader() — call on the Context instance directly.
-    // Do NOT use activity.getClass().getClassLoader(): NativeActivity is a
-    // framework class loaded by BootClassLoader, which cannot see app classes.
-    let class_loader = env
-        .call_method(
-            &act,
-            jni::jni_str!("getClassLoader"),
-            jni::jni_sig!("()Ljava/lang/ClassLoader;"),
-            &[],
-        )
-        .and_then(|v| v.l())
-        .map_err(|e| {
-            env.exception_clear();
-            let msg = format!("getClassLoader failed: {e}");
-            log::error!("find_app_class({class_name}): {msg}");
-            msg
-        })?;
+type ClassCache = Mutex<std::collections::HashMap<String, jni::refs::Global<JObject<'static>>>>;
 
-    // classLoader.loadClass("dev.gpui.mobile.GpuiHelper")
+/// Classes found by [`find_app_class`], by name.
+static APP_CLASSES: OnceLock<ClassCache> = OnceLock::new();
+
+/// The app's class loader, from the application context. A process has one.
+static APP_CLASS_LOADER: OnceLock<jni::refs::Global<JObject<'static>>> = OnceLock::new();
+
+fn load_app_class<'local>(
+    env: &mut jni::Env<'local>,
+    class_name: &str,
+) -> Result<JObject<'local>, String> {
+    let class_loader = match APP_CLASS_LOADER.get() {
+        Some(loader) => env.new_local_ref(loader).e()?,
+        None => {
+            // Not `getClass().getClassLoader()`: on the android-activity path the
+            // Activity is a NativeActivity, a framework class loaded by the boot class
+            // loader, which cannot see app classes.
+            let context = application_context(env)?;
+            let loader = env
+                .call_method(
+                    &context,
+                    jni::jni_str!("getClassLoader"),
+                    jni::jni_sig!("()Ljava/lang/ClassLoader;"),
+                    &[],
+                )
+                .and_then(|v| v.l())
+                .or_clear(env)
+                .map_err(|e| format!("getClassLoader failed: {e}"))?;
+            let _ = APP_CLASS_LOADER.set(env.new_global_ref(&loader).e()?);
+            loader
+        }
+    };
+
     let jname = env.new_string(class_name).e()?;
     let loaded = env
         .call_method(
@@ -302,18 +338,14 @@ pub fn find_app_class<'local>(
             &[JValue::Object(&jname)],
         )
         .and_then(|v| v.l())
+        .or_clear(env)
         .map_err(|e| {
-            // Print full Java stack trace to logcat, then clear.
-            env.exception_describe();
-            env.exception_clear();
             let msg = format!("loadClass({class_name}) failed: {e}");
             log::error!("{msg}");
             msg
         })?;
-
     log::debug!("find_app_class: loaded {class_name}");
-    // SAFETY: `loadClass` returned a `java.lang.Class` local reference in this frame.
-    Ok(unsafe { jni::objects::JClass::from_raw(env, loaded.as_raw()) })
+    Ok(loaded)
 }
 
 // ── global state ─────────────────────────────────────────────────────────────
