@@ -140,19 +140,50 @@ pub fn obtain_env<T>(f: impl FnOnce(&mut jni::Env) -> Result<T, String>) -> Resu
     with_env(f)
 }
 
-/// Get the Activity as a [`JObject`].
+/// The current Activity, as a local reference in `env`'s frame.
 ///
-/// `activity_as_ptr()` returns a JNI global reference from `android-activity`
-/// that is valid for the lifetime of the app. We wrap it in a `JObject`.
+/// On the host-driven path this is the most recently registered Activity that is
+/// neither finishing nor destroyed (see [`set_host_activity`]). The local reference
+/// stays valid for the rest of the frame even if that Activity is destroyed meanwhile.
 ///
-/// Requires `&Env` because jni 0.22's `JObject::from_raw` binds the
-/// local-reference-frame lifetime.
-pub fn activity<'local>(env: &jni::Env<'local>) -> Result<JObject<'local>, String> {
-    let ptr = activity_as_ptr();
-    if ptr.is_null() {
-        return Err("Activity not available".into());
+/// For calls that only need a `Context`, prefer [`application_context`].
+pub fn activity<'local>(env: &mut jni::Env<'local>) -> Result<JObject<'local>, String> {
+    if let Some(app) = ANDROID_APP.get() {
+        // SAFETY: `android-activity` keeps this global reference for the life of the
+        // process.
+        let global = unsafe { JObject::from_raw(env, app.activity_as_ptr() as jni::sys::jobject) };
+        return env.new_local_ref(&global).e();
     }
-    Ok(unsafe { JObject::from_raw(env, ptr as jni::sys::jobject) })
+    let mut activities = HOST_ACTIVITIES.lock().expect("poisoned");
+    // Deleting a global reference is safe while the lock is held: nothing hands out
+    // their raw pointers outside it (except the documented `activity_as_ptr`).
+    prune_gone_activities(env, &mut activities);
+    match activities.last() {
+        Some(activity) => env.new_local_ref(activity).e(),
+        None => Err("Activity not available".into()),
+    }
+}
+
+/// The application context, as a local reference in `env`'s frame. Unlike an
+/// Activity it lives as long as the process, and its configuration follows
+/// system-wide changes.
+pub fn application_context<'local>(env: &mut jni::Env<'local>) -> Result<JObject<'local>, String> {
+    if ANDROID_APP.get().is_some() {
+        let activity = activity(env)?;
+        return env
+            .call_method(
+                &activity,
+                jni::jni_str!("getApplicationContext"),
+                jni::jni_sig!("()Landroid/content/Context;"),
+                &[],
+            )
+            .and_then(|value| value.l())
+            .or_clear(env);
+    }
+    let context = HOST_APPLICATION
+        .get()
+        .ok_or("set_host_activity has not been called")?;
+    env.new_local_ref(context).e()
 }
 
 /// Convert a Java String (`JObject` wrapping a `java.lang.String`) to a Rust `String`.
@@ -339,30 +370,39 @@ pub fn unicode_char_for_key_event(key_code: i32, action: i32, meta_state: i32) -
 /// `AndroidApp` to read it from.
 static HOST_VM: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 
-/// Current Activity for the host-driven entry point, as a JNI global reference we
-/// own. Replaced on every Activity creation so [`activity_as_ptr`] always names the
-/// *live* Activity.
-///
-/// The outgoing reference is kept one generation longer: `activity_as_ptr` hands out a
-/// raw `jobject`, and a call on the render thread may still be using the previous
-/// Activity while the UI thread installs the next one.
-static HOST_ACTIVITY: Mutex<HostActivity> = Mutex::new(HostActivity {
-    current: None,
-    previous: None,
-});
+/// Activities registered by the host-driven entry point, oldest first, as JNI
+/// global references we own. [`activity`] answers with the newest one that is
+/// neither finishing nor destroyed, and drops the references of those that are, so a
+/// finished Activity is neither used nor kept alive.
+static HOST_ACTIVITIES: Mutex<Vec<jni::refs::Global<JObject<'static>>>> = Mutex::new(Vec::new());
 
-struct HostActivity {
-    current: Option<jni::refs::Global<JObject<'static>>>,
-    previous: Option<jni::refs::Global<JObject<'static>>>,
+/// Drop the Activities that are finishing or destroyed.
+fn prune_gone_activities(
+    env: &mut jni::Env<'_>,
+    activities: &mut Vec<jni::refs::Global<JObject<'static>>>,
+) {
+    activities.retain(|activity| !is_gone(env, activity));
+}
+
+fn is_gone(env: &mut jni::Env<'_>, activity: &JObject<'_>) -> bool {
+    let mut ask = |name| {
+        env.call_method(activity, name, jni::jni_sig!("()Z"), &[])
+            .and_then(|value| value.z())
+            .or_clear(env)
+            .unwrap_or(false)
+    };
+    ask(jni::jni_str!("isFinishing")) || ask(jni::jni_str!("isDestroyed"))
 }
 
 /// Register the current Activity when running without `android-activity`.
 ///
 /// Call from a JNI entry point in `Activity.onCreate`, every time — a recreated
 /// Activity is a new object. This module takes its own global reference and records
-/// the JVM, so `java_vm()` / `activity_as_ptr()` and everything built on them (IME,
-/// safe areas, file pickers, `rustls-platform-verifier`) work exactly as on the
-/// `android-activity` path. A no-op when `android-activity` owns the process.
+/// the JVM, so [`activity`], `java_vm()` and everything built on them (IME, safe
+/// areas, file pickers, `rustls-platform-verifier`) work exactly as on the
+/// `android-activity` path. Each Activity is used until it finishes or is destroyed;
+/// with several alive, the most recently registered one is used. A no-op when
+/// `android-activity` owns the process.
 /// Call it before `host::start`: the platform reads bundled assets (the emoji font)
 /// when it starts.
 pub fn set_host_activity(env: &mut jni::Env<'_>, activity: &JObject<'_>) -> Result<(), String> {
@@ -375,13 +415,13 @@ pub fn set_host_activity(env: &mut jni::Env<'_>, activity: &JObject<'_>) -> Resu
         vm.get_raw() as *mut c_void,
         std::sync::atomic::Ordering::SeqCst,
     );
-    let mut slot = HOST_ACTIVITY.lock().expect("poisoned");
-    slot.previous = slot.current.take();
-    slot.current = Some(global);
-    drop(slot);
+    let mut activities = HOST_ACTIVITIES.lock().expect("poisoned");
+    prune_gone_activities(env, &mut activities);
+    activities.push(global);
+    drop(activities);
     super::accessibility::activity_changed();
     if HOST_APPLICATION.get().is_none() {
-        match application_context(env, activity) {
+        match fetch_application_context(env, activity) {
             Ok(context) => {
                 let _ = HOST_APPLICATION.set(context);
             }
@@ -414,7 +454,7 @@ pub fn set_host_activity(env: &mut jni::Env<'_>, activity: &JObject<'_>) -> Resu
 /// mode, whichever Activity is in front and whatever it handles itself.
 static HOST_APPLICATION: OnceLock<jni::refs::Global<JObject<'static>>> = OnceLock::new();
 
-fn application_context(
+fn fetch_application_context(
     env: &mut jni::Env<'_>,
     activity: &JObject<'_>,
 ) -> Result<jni::refs::Global<JObject<'static>>, String> {
@@ -499,25 +539,21 @@ pub fn java_vm() -> *mut c_void {
         .unwrap_or_else(|| HOST_VM.load(std::sync::atomic::Ordering::SeqCst))
 }
 
-/// Public accessor for the current Activity's JNI object reference.
+/// The current Activity as a raw JNI global reference (a `jobject`, not an
+/// `ANativeActivity *`), or null.
 ///
-/// Uses `AndroidApp::activity_as_ptr()` from the stored `AndroidApp`.
-/// Used by `platform.rs` and `window.rs` for JNI calls that require the
-/// activity's jobject.
-///
-/// NOTE: This returns a jobject (JNI global ref), NOT an `ANativeActivity *`.
-/// Code that previously used `(*activity).clazz` should use this directly
-/// as the activity jobject.
+/// On the host-driven path the reference is deleted once its Activity finishes and a
+/// later [`activity`] or [`set_host_activity`] call notices, so it must not be kept.
+/// Prefer [`activity`], which returns a local reference.
 pub fn activity_as_ptr() -> *mut c_void {
     ANDROID_APP
         .get()
         .map(|app| app.activity_as_ptr())
         .unwrap_or_else(|| {
-            HOST_ACTIVITY
+            HOST_ACTIVITIES
                 .lock()
                 .expect("poisoned")
-                .current
-                .as_ref()
+                .last()
                 .map(|activity| activity.as_raw() as *mut c_void)
                 .unwrap_or(std::ptr::null_mut())
         })

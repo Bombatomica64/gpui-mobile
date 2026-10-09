@@ -773,13 +773,13 @@ impl AndroidPlatform {
         use jni::objects::JValue;
 
         jni_helpers::with_env(|env| {
-            let activity = jni_helpers::activity(env)?;
+            let context = jni_helpers::application_context(env)?;
 
-            // activity.getSystemService("input_method")
+            // context.getSystemService("input_method")
             let service_name = env.new_string("input_method").or_clear(env)?;
             let imm = env
                 .call_method(
-                    &activity,
+                    &context,
                     jni::jni_str!("getSystemService"),
                     jni::jni_sig!("(Ljava/lang/String;)Ljava/lang/Object;"),
                     &[JValue::Object(&service_name)],
@@ -876,13 +876,13 @@ impl AndroidPlatform {
         use jni::objects::JValue;
 
         jni_helpers::with_env(|env| {
-            let activity = jni_helpers::activity(env)?;
+            let context = jni_helpers::application_context(env)?;
 
-            // activity.getSystemService("power")
+            // context.getSystemService("power")
             let service_name = env.new_string("power").or_clear(env)?;
             let pm = match env
                 .call_method(
-                    &activity,
+                    &context,
                     jni::jni_str!("getSystemService"),
                     jni::jni_sig!("(Ljava/lang/String;)Ljava/lang/Object;"),
                     &[JValue::Object(&service_name)],
