@@ -35,8 +35,9 @@
 //! callback — so a host may stack several AI screens and each returns to its own
 //! panel. Reuse the same id across an Activity's configuration changes; pick a fresh
 //! one for a new instance.
-//! 3. From `onResume` / `onPause`: [`resumed`] / [`paused`], and from
-//!    `onConfigurationChanged` (if the Activity handles any): [`configuration_changed`].
+//! 3. From `onResume` / `onPause`: [`resumed`] / [`paused`]. An Activity that
+//!    lists `uiMode` in `configChanges` must also call [`configuration_changed`] from
+//!    `onConfigurationChanged`, or its window keeps the old night mode until resumed.
 //! 4. From `onTouchEvent`, `dispatchKeyEvent` and the `InputConnection`:
 //!    [`motion_event`], [`key`], [`ime_event`].
 //!
@@ -376,8 +377,9 @@ fn render_thread(launch: Launch) {
                 }
                 Command::ConfigurationChanged => {
                     platform.notify_keyboard_layout_change();
-                    if let Some(win) = attached_window(&app) {
-                        super::jni::sync_appearance(&win);
+                    // Night mode is process-wide: stacked hosts' windows follow too.
+                    for win in app.windows.values() {
+                        super::jni::sync_appearance(win);
                     }
                 }
                 Command::Paused { host } => {
@@ -681,6 +683,7 @@ pub fn ime_event(session: u64, kind: i32, text: String, start: usize, end: usize
 
 /// Call from `Activity.onConfigurationChanged`, for an Activity that handles
 /// configuration changes (`uiMode` for night mode) instead of being recreated.
+/// Applies the system night mode to every host's window.
 pub fn configuration_changed() {
     post(Command::ConfigurationChanged);
 }

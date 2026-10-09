@@ -378,8 +378,10 @@ impl AndroidPlatform {
 
             if !emoji_loaded {
                 // Try loading the bundled CBDT NotoColorEmoji from APK assets.
-                if let Some(assets) = crate::android::jni::asset_manager() {
-                    match load_asset_bytes(&assets, "fonts/NotoColorEmoji.ttf") {
+                if let Some(result) = crate::android::jni::with_asset_manager(|assets| {
+                    load_asset_bytes(assets, "fonts/NotoColorEmoji.ttf")
+                }) {
+                    match result {
                         Ok(bytes) => {
                             log::info!(
                                 "loaded bundled CBDT emoji font from assets ({} bytes)",
