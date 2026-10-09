@@ -4,9 +4,9 @@ use jni::objects::{JObject, JValue};
 
 pub fn vibrate(duration_ms: u32) -> Result<(), String> {
     jni_helpers::with_env(|env| {
-        let activity = jni_helpers::activity(env)?;
+        let context = jni_helpers::application_context(env)?;
 
-        let vibrator = get_vibrator_service(env, &activity)?;
+        let vibrator = get_vibrator_service(env, &context)?;
 
         // Try VibrationEffect.createOneShot (API 26+)
         if let Ok(ve_cls) = env.find_class(jni::jni_str!("android/os/VibrationEffect")) {
@@ -100,9 +100,9 @@ pub fn haptic_feedback(feedback: HapticFeedback) -> Result<(), String> {
 
 pub fn can_vibrate() -> bool {
     jni_helpers::with_env(|env| {
-        let activity = jni_helpers::activity(env)?;
+        let context = jni_helpers::application_context(env)?;
 
-        let vibrator = get_vibrator_service(env, &activity)?;
+        let vibrator = get_vibrator_service(env, &context)?;
 
         let result = env
             .call_method(
@@ -121,12 +121,12 @@ pub fn can_vibrate() -> bool {
 
 fn get_vibrator_service<'local>(
     env: &mut jni::Env<'local>,
-    activity: &JObject<'_>,
+    context: &JObject<'_>,
 ) -> Result<JObject<'local>, String> {
     let service_name = env.new_string("vibrator").e()?;
     let vibrator = env
         .call_method(
-            activity,
+            context,
             jni::jni_str!("getSystemService"),
             jni::jni_sig!("(Ljava/lang/String;)Ljava/lang/Object;"),
             &[JValue::Object(&service_name)],

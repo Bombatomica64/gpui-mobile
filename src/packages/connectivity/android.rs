@@ -4,13 +4,13 @@ use jni::objects::JValue;
 
 pub fn check_connectivity() -> ConnectivityStatus {
     jni_helpers::with_env(|env| {
-        let activity = jni_helpers::activity(env)?;
+        let context = jni_helpers::application_context(env)?;
 
         // context.getSystemService("connectivity") → ConnectivityManager
         let service_name = env.new_string("connectivity").map_err(|e| e.to_string())?;
         let cm = match env
             .call_method(
-                &activity,
+                &context,
                 jni::jni_str!("getSystemService"),
                 jni::jni_sig!("(Ljava/lang/String;)Ljava/lang/Object;"),
                 &[JValue::Object(&service_name)],

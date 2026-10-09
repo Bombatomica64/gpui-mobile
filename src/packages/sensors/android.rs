@@ -10,9 +10,9 @@ const TYPE_PRESSURE: i32 = 6;
 
 pub fn available_sensors() -> SensorAvailability {
     jni_helpers::with_env(|env| {
-        let activity = jni_helpers::activity(env)?;
+        let context = jni_helpers::application_context(env)?;
 
-        let sm = match get_sensor_manager(env, &activity) {
+        let sm = match get_sensor_manager(env, &context) {
             Some(sm) => sm,
             None => return Ok(SensorAvailability::default()),
         };
@@ -50,12 +50,12 @@ pub fn barometer() -> Option<BarometerData> {
 
 fn get_sensor_manager<'local>(
     env: &mut jni::Env<'local>,
-    activity: &jni::objects::JObject<'_>,
+    context: &jni::objects::JObject<'_>,
 ) -> Option<jni::objects::JObject<'local>> {
     let service_name = env.new_string("sensor").ok()?;
     let sm = env
         .call_method(
-            activity,
+            context,
             jni::jni_str!("getSystemService"),
             jni::jni_sig!("(Ljava/lang/String;)Ljava/lang/Object;"),
             &[JValue::Object(&service_name)],

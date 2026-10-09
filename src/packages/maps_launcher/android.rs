@@ -136,14 +136,14 @@ pub fn open_directions(
 
 pub fn is_available() -> Result<bool, String> {
     jni_helpers::with_env(|env| {
-        let activity = jni_helpers::activity(env)?;
+        let context = jni_helpers::application_context(env)?;
 
         let intent = create_geo_intent(env, "geo:0,0")?;
 
-        // activity.getPackageManager()
+        // context.getPackageManager()
         let pm = env
             .call_method(
-                &activity,
+                &context,
                 jni::jni_str!("getPackageManager"),
                 jni::jni_sig!("()Landroid/content/pm/PackageManager;"),
                 &[],

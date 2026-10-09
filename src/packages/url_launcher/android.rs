@@ -28,14 +28,14 @@ pub fn launch_url(url: &str) -> Result<bool, String> {
 pub fn can_launch_url(url: &str) -> Result<bool, String> {
     let url = url.to_owned();
     jni_helpers::with_env(|env| {
-        let activity = jni_helpers::activity(env)?;
+        let context = jni_helpers::application_context(env)?;
 
         let intent = create_view_intent(env, &url)?;
 
-        // activity.getPackageManager()
+        // context.getPackageManager()
         let pm = env
             .call_method(
-                &activity,
+                &context,
                 jni::jni_str!("getPackageManager"),
                 jni::jni_sig!("()Landroid/content/pm/PackageManager;"),
                 &[],

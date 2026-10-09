@@ -4,12 +4,12 @@ use jni::objects::JValue;
 
 pub fn get_package_info() -> Result<PackageInfo, String> {
     jni_helpers::with_env(|env| {
-        let activity = jni_helpers::activity(env)?;
+        let context = jni_helpers::application_context(env)?;
 
-        // activity.getPackageName() → String
+        // context.getPackageName() → String
         let pkg_name_obj = env
             .call_method(
-                &activity,
+                &context,
                 jni::jni_str!("getPackageName"),
                 jni::jni_sig!("()Ljava/lang/String;"),
                 &[],
@@ -18,10 +18,10 @@ pub fn get_package_info() -> Result<PackageInfo, String> {
             .or_clear(env)?;
         let package_name = get_string(env, &pkg_name_obj);
 
-        // activity.getPackageManager() → PackageManager
+        // context.getPackageManager() → PackageManager
         let pm = env
             .call_method(
-                &activity,
+                &context,
                 jni::jni_str!("getPackageManager"),
                 jni::jni_sig!("()Landroid/content/pm/PackageManager;"),
                 &[],

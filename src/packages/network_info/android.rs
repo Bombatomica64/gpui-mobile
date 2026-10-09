@@ -4,14 +4,14 @@ use jni::objects::JValue;
 
 pub fn get_network_info() -> Result<NetworkInfo, String> {
     jni_helpers::with_env(|env| {
-        let activity = jni_helpers::activity(env)?;
+        let context = jni_helpers::application_context(env)?;
         let mut info = NetworkInfo::default();
 
         // context.getSystemService("wifi") → WifiManager
         let service_name = env.new_string("wifi").map_err(|e| e.to_string())?;
         let wifi_mgr = match env
             .call_method(
-                &activity,
+                &context,
                 jni::jni_str!("getSystemService"),
                 jni::jni_sig!("(Ljava/lang/String;)Ljava/lang/Object;"),
                 &[JValue::Object(&service_name)],

@@ -35,13 +35,13 @@ pub fn battery_state() -> BatteryState {
 
 pub fn is_battery_save_mode() -> bool {
     jni_helpers::with_env(|env| {
-        let activity = jni_helpers::activity(env)?;
+        let context = jni_helpers::application_context(env)?;
 
         // PowerManager pm = (PowerManager) context.getSystemService("power");
         let service_name = env.new_string("power").map_err(|e| e.to_string())?;
         let pm = match env
             .call_method(
-                &activity,
+                &context,
                 jni::jni_str!("getSystemService"),
                 jni::jni_sig!("(Ljava/lang/String;)Ljava/lang/Object;"),
                 &[JValue::Object(&service_name)],
