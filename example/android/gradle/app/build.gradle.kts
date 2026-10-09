@@ -77,6 +77,9 @@ android {
         // Prevent stripping of the Rust library — cargo already strips in
         // release mode and stripping again can break backtraces.
         jniLibs {
+            // Store the library deflated (minSdk 23+ defaults to stored), about
+            // 60% smaller APK; Android extracts it on install.
+            useLegacyPackaging = true
             keepDebugSymbols += listOf(
                 "*/arm64-v8a/libgpui_mobile_example.so",
                 "*/armeabi-v7a/libgpui_mobile_example.so",
