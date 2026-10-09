@@ -15,14 +15,20 @@ pub fn is_available() -> Result<bool, String> {
             .and_then(|v| v.l())
             .or_clear(env)?;
         let package = env.new_string("com.android.vending").e()?;
-        let info = env.call_method(
-            &pm,
-            jni::jni_str!("getPackageInfo"),
-            jni::jni_sig!("(Ljava/lang/String;I)Landroid/content/pm/PackageInfo;"),
-            &[JValue::Object(&package), JValue::Int(0)],
-        );
-        // NameNotFoundException: not installed.
-        Ok(info.or_clear(env).is_ok())
+        let info = env
+            .call_method(
+                &pm,
+                jni::jni_str!("getPackageInfo"),
+                jni::jni_sig!("(Ljava/lang/String;I)Landroid/content/pm/PackageInfo;"),
+                &[JValue::Object(&package), JValue::Int(0)],
+            )
+            .or_catch(
+                env,
+                jni::jni_str!("android/content/pm/PackageManager$NameNotFoundException"),
+            )?;
+        // NameNotFoundException: not installed (or not visible without a <queries>
+        // entry on API 30+).
+        Ok(info.is_some())
     })
 }
 
@@ -56,9 +62,14 @@ pub fn open_store_listing(app_id: &str) -> Result<(), String> {
     }
 }
 
-/// Open `app_id`'s page in the Play Store app, or on the web without it.
+/// Open `app_id`'s page in the Play Store app, or on the web if that fails for any
+/// reason.
 fn open_store_page(app_id: &str) -> Result<bool, String> {
-    Ok(view(&format!("market://details?id={app_id}"))?
+    let in_store = view(&format!("market://details?id={app_id}")).unwrap_or_else(|err| {
+        log::debug!("in_app_review: market:// failed, trying the web: {err}");
+        false
+    });
+    Ok(in_store
         || view(&format!(
             "https://play.google.com/store/apps/details?id={app_id}"
         ))?)
@@ -94,13 +105,17 @@ fn view(uri: &str) -> Result<bool, String> {
             &[JValue::Int(FLAG_ACTIVITY_NEW_TASK)],
         )
         .or_clear(env)?;
-        let started = env.call_method(
-            &activity,
-            jni::jni_str!("startActivity"),
-            jni::jni_sig!("(Landroid/content/Intent;)V"),
-            &[JValue::Object(&intent)],
-        );
-        // ActivityNotFoundException: no app for this URI.
-        Ok(started.or_clear(env).is_ok())
+        let started = env
+            .call_method(
+                &activity,
+                jni::jni_str!("startActivity"),
+                jni::jni_sig!("(Landroid/content/Intent;)V"),
+                &[JValue::Object(&intent)],
+            )
+            .or_catch(
+                env,
+                jni::jni_str!("android/content/ActivityNotFoundException"),
+            )?;
+        Ok(started.is_some())
     })
 }
