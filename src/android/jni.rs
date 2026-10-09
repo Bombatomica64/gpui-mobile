@@ -1940,7 +1940,7 @@ pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiActivity_nativeOnDeepLink(
 
         #[cfg(feature = "deeplink")]
         {
-            crate::packages::deeplink::notify_deep_link(&url_string);
+            crate::packages::deeplink::handle_link(&url_string);
         }
         Ok(())
     }) {
