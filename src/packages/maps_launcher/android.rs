@@ -30,17 +30,19 @@ pub fn open_coordinates(
         // Add FLAG_ACTIVITY_NEW_TASK
         add_new_task_flag(env, &intent)?;
 
-        match env.call_method(
-            &activity,
-            jni::jni_str!("startActivity"),
-            jni::jni_sig!("(Landroid/content/Intent;)V"),
-            &[JValue::Object(&intent)],
-        ) {
-            Ok(_) => Ok(true),
-            Err(_) => {
-                env.exception_clear();
-                Ok(false)
-            }
+        match env
+            .call_method(
+                &activity,
+                jni::jni_str!("startActivity"),
+                jni::jni_sig!("(Landroid/content/Intent;)V"),
+                &[JValue::Object(&intent)],
+            )
+            .or_catch(
+                env,
+                jni::jni_str!("android/content/ActivityNotFoundException"),
+            )? {
+            Some(_) => Ok(true),
+            None => Ok(false),
         }
     })
 }
@@ -55,17 +57,19 @@ pub fn open_query(query: &str) -> Result<bool, String> {
         let intent = create_geo_intent(env, &uri_str)?;
         add_new_task_flag(env, &intent)?;
 
-        match env.call_method(
-            &activity,
-            jni::jni_str!("startActivity"),
-            jni::jni_sig!("(Landroid/content/Intent;)V"),
-            &[JValue::Object(&intent)],
-        ) {
-            Ok(_) => Ok(true),
-            Err(_) => {
-                env.exception_clear();
-                Ok(false)
-            }
+        match env
+            .call_method(
+                &activity,
+                jni::jni_str!("startActivity"),
+                jni::jni_sig!("(Landroid/content/Intent;)V"),
+                &[JValue::Object(&intent)],
+            )
+            .or_catch(
+                env,
+                jni::jni_str!("android/content/ActivityNotFoundException"),
+            )? {
+            Some(_) => Ok(true),
+            None => Ok(false),
         }
     })
 }
@@ -91,24 +95,27 @@ pub fn open_directions(
 
         // Set package to Google Maps
         let pkg = env.new_string("com.google.android.apps.maps").e()?;
-        let _ = env
-            .call_method(
-                &intent,
-                jni::jni_str!("setPackage"),
-                jni::jni_sig!("(Ljava/lang/String;)Landroid/content/Intent;"),
-                &[JValue::Object(&pkg)],
-            )
-            .or_clear(env)?;
+        env.call_method(
+            &intent,
+            jni::jni_str!("setPackage"),
+            jni::jni_sig!("(Ljava/lang/String;)Landroid/content/Intent;"),
+            &[JValue::Object(&pkg)],
+        )
+        .or_clear(env)?;
 
-        match env.call_method(
-            &activity,
-            jni::jni_str!("startActivity"),
-            jni::jni_sig!("(Landroid/content/Intent;)V"),
-            &[JValue::Object(&intent)],
-        ) {
-            Ok(_) => Ok(true),
-            Err(_) => {
-                env.exception_clear();
+        match env
+            .call_method(
+                &activity,
+                jni::jni_str!("startActivity"),
+                jni::jni_sig!("(Landroid/content/Intent;)V"),
+                &[JValue::Object(&intent)],
+            )
+            .or_catch(
+                env,
+                jni::jni_str!("android/content/ActivityNotFoundException"),
+            )? {
+            Some(_) => Ok(true),
+            None => {
                 // Fallback to generic geo intent
                 let fallback_uri = format!(
                     "geo:{},{}?q={},{}",
@@ -117,17 +124,19 @@ pub fn open_directions(
                 let fallback_intent = create_geo_intent(env, &fallback_uri)?;
                 add_new_task_flag(env, &fallback_intent)?;
 
-                match env.call_method(
-                    &activity,
-                    jni::jni_str!("startActivity"),
-                    jni::jni_sig!("(Landroid/content/Intent;)V"),
-                    &[JValue::Object(&fallback_intent)],
-                ) {
-                    Ok(_) => Ok(true),
-                    Err(_) => {
-                        env.exception_clear();
-                        Ok(false)
-                    }
+                match env
+                    .call_method(
+                        &activity,
+                        jni::jni_str!("startActivity"),
+                        jni::jni_sig!("(Landroid/content/Intent;)V"),
+                        &[JValue::Object(&fallback_intent)],
+                    )
+                    .or_catch(
+                        env,
+                        jni::jni_str!("android/content/ActivityNotFoundException"),
+                    )? {
+                    Some(_) => Ok(true),
+                    None => Ok(false),
                 }
             }
         }
@@ -162,15 +171,9 @@ pub fn is_available() -> Result<bool, String> {
                 jni::jni_sig!("(Landroid/content/Intent;I)Landroid/content/pm/ResolveInfo;"),
                 &[JValue::Object(&intent), JValue::Int(0)],
             )
-            .and_then(|v| v.l());
-
-        match resolved {
-            Ok(r) => Ok(!r.is_null()),
-            Err(_) => {
-                env.exception_clear();
-                Ok(false)
-            }
-        }
+            .and_then(|v| v.l())
+            .or_clear(env)?;
+        Ok(!resolved.is_null())
     })
 }
 
@@ -211,14 +214,13 @@ fn add_new_task_flag(
     intent: &jni::objects::JObject<'_>,
 ) -> Result<(), String> {
     // FLAG_ACTIVITY_NEW_TASK = 0x10000000
-    let _ = env
-        .call_method(
-            intent,
-            jni::jni_str!("addFlags"),
-            jni::jni_sig!("(I)Landroid/content/Intent;"),
-            &[JValue::Int(0x10000000)],
-        )
-        .or_clear(env)?;
+    env.call_method(
+        intent,
+        jni::jni_str!("addFlags"),
+        jni::jni_sig!("(I)Landroid/content/Intent;"),
+        &[JValue::Int(0x10000000)],
+    )
+    .or_clear(env)?;
     Ok(())
 }
 

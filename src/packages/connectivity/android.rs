@@ -1,5 +1,5 @@
 use super::ConnectivityStatus;
-use crate::android::jni as jni_helpers;
+use crate::android::jni::{self as jni_helpers, JniExt, JniResultExt as _};
 use jni::objects::JValue;
 
 pub fn check_connectivity() -> ConnectivityStatus {
@@ -7,8 +7,8 @@ pub fn check_connectivity() -> ConnectivityStatus {
         let context = jni_helpers::application_context(env)?;
 
         // context.getSystemService("connectivity") → ConnectivityManager
-        let service_name = env.new_string("connectivity").map_err(|e| e.to_string())?;
-        let cm = match env
+        let service_name = env.new_string("connectivity").e()?;
+        let cm = env
             .call_method(
                 &context,
                 jni::jni_str!("getSystemService"),
@@ -16,16 +16,13 @@ pub fn check_connectivity() -> ConnectivityStatus {
                 &[JValue::Object(&service_name)],
             )
             .and_then(|v| v.l())
-        {
-            Ok(o) if !o.is_null() => o,
-            _ => {
-                env.exception_clear();
-                return Ok(ConnectivityStatus::None);
-            }
-        };
+            .or_clear(env)?;
+        if cm.is_null() {
+            return Err("no ConnectivityManager".into());
+        }
 
-        // cm.getActiveNetworkInfo() → NetworkInfo
-        let net_info = match env
+        // cm.getActiveNetworkInfo() → NetworkInfo, null when offline
+        let net_info = env
             .call_method(
                 &cm,
                 jni::jni_str!("getActiveNetworkInfo"),
@@ -33,16 +30,13 @@ pub fn check_connectivity() -> ConnectivityStatus {
                 &[],
             )
             .and_then(|v| v.l())
-        {
-            Ok(o) if !o.is_null() => o,
-            _ => {
-                env.exception_clear();
-                return Ok(ConnectivityStatus::None);
-            }
-        };
+            .or_clear(env)?;
+        if net_info.is_null() {
+            return Ok(ConnectivityStatus::None);
+        }
 
         // networkInfo.isConnected()
-        let connected = match env
+        let connected = env
             .call_method(
                 &net_info,
                 jni::jni_str!("isConnected"),
@@ -50,19 +44,13 @@ pub fn check_connectivity() -> ConnectivityStatus {
                 &[],
             )
             .and_then(|v| v.z())
-        {
-            Ok(c) => c,
-            Err(_) => {
-                env.exception_clear();
-                return Ok(ConnectivityStatus::None);
-            }
-        };
+            .or_clear(env)?;
         if !connected {
             return Ok(ConnectivityStatus::None);
         }
 
         // networkInfo.getType()
-        match env
+        let network_type = env
             .call_method(
                 &net_info,
                 jni::jni_str!("getType"),
@@ -70,15 +58,15 @@ pub fn check_connectivity() -> ConnectivityStatus {
                 &[],
             )
             .and_then(|v| v.i())
-        {
-            Ok(1) => Ok(ConnectivityStatus::Wifi),     // TYPE_WIFI
-            Ok(0) => Ok(ConnectivityStatus::Cellular), // TYPE_MOBILE
-            Ok(_) => Ok(ConnectivityStatus::Wifi),     // Ethernet etc. treated as Wifi
-            Err(_) => {
-                env.exception_clear();
-                Ok(ConnectivityStatus::None)
-            }
-        }
+            .or_clear(env)?;
+        Ok(match network_type {
+            1 => ConnectivityStatus::Wifi,     // TYPE_WIFI
+            0 => ConnectivityStatus::Cellular, // TYPE_MOBILE
+            _ => ConnectivityStatus::Wifi,     // Ethernet etc. treated as Wifi
+        })
     })
-    .unwrap_or(ConnectivityStatus::None)
+    .unwrap_or_else(|err| {
+        log::warn!("check_connectivity: {err}");
+        ConnectivityStatus::None
+    })
 }
