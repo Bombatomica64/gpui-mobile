@@ -397,6 +397,9 @@ pub struct AndroidWindow {
     /// present an empty image (a black screen). One `force_render` frame
     /// repopulates it.
     force_render_once: Arc<std::sync::atomic::AtomicBool>,
+    /// GPUI's accessibility callbacks, once a screen reader has been asked for. The
+    /// screen reader follows whichever window is active.
+    a11y: std::sync::Mutex<Option<super::accessibility::Handlers>>,
 }
 
 // SAFETY: `WindowState` is protected by a `Mutex`.
@@ -476,6 +479,7 @@ impl AndroidWindow {
             id,
             active: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             force_render_once: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            a11y: Default::default(),
         }))
     }
 
@@ -510,6 +514,7 @@ impl AndroidWindow {
             id: ((width as u64) << 32) | (height as u64),
             active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             force_render_once: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            a11y: Default::default(),
         })
     }
 
@@ -986,6 +991,11 @@ impl AndroidWindow {
                 }
             }
             log::info!("AndroidWindow::set_active({}) — done", active);
+            if active {
+                if let Some(handlers) = self.a11y.lock().expect("poisoned").clone() {
+                    super::accessibility::init(&handlers);
+                }
+            }
         }
         if active {
             // A vsync callback posted before the app left the foreground may
@@ -1548,11 +1558,15 @@ impl PlatformWindow for AndroidPlatformWindow {
     }
 
     fn a11y_init(&self, callbacks: gpui::A11yCallbacks) {
-        super::accessibility::init(callbacks);
+        let handlers = super::accessibility::Handlers::new(callbacks);
+        *self.window.a11y.lock().expect("poisoned") = Some(handlers.clone());
+        super::accessibility::init(&handlers);
     }
 
     fn a11y_tree_update(&self, tree_update: gpui::accesskit::TreeUpdate) {
-        super::accessibility::update(tree_update);
+        if let Some(handlers) = self.window.a11y.lock().expect("poisoned").clone() {
+            super::accessibility::update(&handlers, tree_update);
+        }
     }
 
     fn prompt(

@@ -9,8 +9,9 @@
 //! the decor view on the `android-activity` path (the native surface fills the window)
 //! and the content view on the host-driven path (it holds the `SurfaceView`).
 //!
-//! There is one GPUI window per Activity, so the state is global. A recreated Activity
-//! has new views; [`super::jni::set_host_activity`] moves the adapter onto them.
+//! Only the active window's Activity is on screen, so one adapter serves the active
+//! window, and a window that becomes active takes it over. A recreated Activity has
+//! new views; [`super::jni::set_host_activity`] moves the adapter onto them.
 //!
 //! This adapter version has no "screen reader stopped" callback and raises events
 //! without checking whether anyone listens, which Android answers by throwing on the
@@ -49,9 +50,19 @@ struct Adapter {
     manager: GlobalRef,
 }
 
-/// GPUI's callbacks, shared by every adapter a recreated Activity gets.
+/// One window's GPUI callbacks, shared by every adapter its Activity gets.
 #[derive(Clone)]
-struct Handlers(Arc<Mutex<A11yCallbacks>>);
+pub(super) struct Handlers(Arc<Mutex<A11yCallbacks>>);
+
+impl Handlers {
+    pub(super) fn new(callbacks: A11yCallbacks) -> Self {
+        Self(Arc::new(Mutex::new(callbacks)))
+    }
+
+    fn deactivate(&self) {
+        (self.0.lock().expect("poisoned").deactivation)();
+    }
+}
 
 impl ActivationHandler for Handlers {
     fn request_initial_tree(&mut self) -> Option<TreeUpdate> {
@@ -65,21 +76,32 @@ impl ActionHandler for Handlers {
     }
 }
 
-/// `PlatformWindow::a11y_init`, on the GPUI thread.
-pub(super) fn init(callbacks: A11yCallbacks) {
+/// Point the screen reader at this window, on the GPUI thread. Called from
+/// `PlatformWindow::a11y_init` and when the window becomes active again.
+pub(super) fn init(callbacks: &Handlers) {
     let mut bridge = BRIDGE.lock().expect("poisoned");
+    if let Some(previous) = bridge.as_ref() {
+        if Arc::ptr_eq(&previous.callbacks.0, &callbacks.0) {
+            return;
+        }
+        // The previous window is off screen; stop it building trees.
+        previous.callbacks.deactivate();
+    }
     bridge
         .insert(Bridge {
-            callbacks: Handlers(Arc::new(Mutex::new(callbacks))),
+            callbacks: callbacks.clone(),
             adapter: None,
         })
         .attach();
 }
 
 /// `PlatformWindow::a11y_tree_update`, on the GPUI thread that called [`init`].
-pub(super) fn update(tree: TreeUpdate) {
+pub(super) fn update(callbacks: &Handlers, tree: TreeUpdate) {
     let mut bridge = BRIDGE.lock().expect("poisoned");
-    let Some(bridge) = bridge.as_mut() else {
+    let Some(bridge) = bridge
+        .as_mut()
+        .filter(|bridge| Arc::ptr_eq(&bridge.callbacks.0, &callbacks.0))
+    else {
         return;
     };
     let Some(adapter) = bridge.adapter.as_mut() else {
@@ -91,7 +113,7 @@ pub(super) fn update(tree: TreeUpdate) {
     }
     // The screen reader has gone. Stop GPUI building trees, and swap in an adapter
     // that is not yet active, so the next screen reader activates GPUI again.
-    (bridge.callbacks.0.lock().expect("poisoned").deactivation)();
+    bridge.callbacks.deactivate();
     bridge.attach();
 }
 
