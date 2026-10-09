@@ -6,7 +6,6 @@ import android.os.Build;
 
 import java.util.ArrayList;
 import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Biometric authentication helper for GPUI.
@@ -15,19 +14,30 @@ import java.util.concurrent.atomic.AtomicInteger;
  * {@link GpuiAuthActivity} (a transparent FragmentActivity) to show the
  * BiometricPrompt dialog.</p>
  *
- * <p>The {@code authenticate} method blocks the calling thread via a
- * {@link CountDownLatch} until the prompt completes.</p>
+ * <p>The {@code authenticate} method blocks the calling thread, which must not be
+ * the UI thread, until the prompt completes or {@link GpuiAuthActivity} goes away.</p>
  */
 public final class GpuiLocalAuth {
 
-    /** Latch that the calling (native) thread waits on. */
-    static CountDownLatch sLatch;
+    /** One authentication request, and the result code the calling thread waits for. */
+    static final class Request {
+        final String reason;
+        final CountDownLatch done = new CountDownLatch(1);
+        int result = 7;
 
-    /** Authentication result code (see int constants below). */
-    static AtomicInteger sResult = new AtomicInteger(7);
+        Request(String reason) { this.reason = reason; }
 
-    /** Reason string displayed in the biometric prompt. */
-    static String sReason;
+        synchronized void complete(int result) {
+            if (done.getCount() == 0) return;
+            this.result = result;
+            done.countDown();
+        }
+    }
+
+    /** The request being shown; one at a time. */
+    private static Request sPending;
+
+    static synchronized Request pending() { return sPending; }
 
     // Result codes (must match Rust int_to_auth_result)
     // 0 = success, 1 = failed, 2 = not_available, 3 = not_enrolled,
@@ -96,14 +106,14 @@ public final class GpuiLocalAuth {
      * Authenticate the user with biometrics. Blocks until complete.
      *
      * <p>Launches {@link GpuiAuthActivity} which shows a BiometricPrompt.
-     * The calling thread blocks on a {@link CountDownLatch} until the
-     * prompt callback fires.</p>
+     * The calling thread blocks until the prompt callback fires or the
+     * Activity is destroyed.</p>
      *
      * @param activity the current Activity context
      * @param reason   the reason string shown to the user
      * @return result code (0=success, 1=failed, 2=not_available, etc.)
      */
-    public static int authenticate(Activity activity, String reason) {
+    public static int authenticate(Activity activity, String reason) throws InterruptedException {
         if (!canAuthenticate(activity)) {
             if (!isDeviceSupported(activity)) {
                 return 2; // not available
@@ -111,23 +121,21 @@ public final class GpuiLocalAuth {
             return 3; // not enrolled
         }
 
-        CountDownLatch latch = new CountDownLatch(1);
-        sLatch = latch;
-        sResult.set(7); // default: other error
-        sReason = reason;
-
-        // Launch GpuiAuthActivity which will show BiometricPrompt
-        Intent intent = new Intent(activity, GpuiAuthActivity.class);
-        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-        activity.startActivity(intent);
-
-        try {
-            latch.await();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            return 7; // other error
+        Request request = new Request(reason);
+        synchronized (GpuiLocalAuth.class) {
+            if (sPending != null) throw new IllegalStateException("An authentication prompt is already open");
+            sPending = request;
         }
-        return sResult.get();
+        try {
+            // Launch GpuiAuthActivity which will show BiometricPrompt
+            activity.startActivity(new Intent(activity, GpuiAuthActivity.class));
+            request.done.await();
+            return request.result;
+        } finally {
+            synchronized (GpuiLocalAuth.class) {
+                if (sPending == request) sPending = null;
+            }
+        }
     }
 
     private GpuiLocalAuth() {}

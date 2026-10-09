@@ -6,6 +6,10 @@
 //!
 //! Inspired by [file_selector](https://pub.dev/packages/file_selector).
 //!
+//! On Android, the calls that show a picker block until the user is done, and
+//! return an error on GPUI's thread or the UI thread: call them from a background
+//! thread, e.g. `cx.background_spawn(async move { ... })`.
+//!
 //! Feature-gated behind `file_selector`.
 
 #[cfg(target_os = "android")]

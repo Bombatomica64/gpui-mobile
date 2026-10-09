@@ -13,16 +13,25 @@ import androidx.fragment.app.FragmentActivity;
  * <p>NativeActivity is not a FragmentActivity, so it cannot host a
  * BiometricPrompt directly. This lightweight Activity is launched by
  * {@link GpuiLocalAuth#authenticate} and immediately shows the prompt.
- * On completion (success, failure, or cancellation) it stores the result
- * in {@link GpuiLocalAuth#sResult}, counts down the latch, and finishes.</p>
+ * On completion (success, failure, or cancellation) it hands the result to the
+ * thread waiting in {@link GpuiLocalAuth#authenticate} and finishes; if it goes
+ * away first, the wait ends as cancelled.</p>
  */
 public class GpuiAuthActivity extends FragmentActivity {
+
+    private GpuiLocalAuth.Request mRequest;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
-        String reason = GpuiLocalAuth.sReason;
+        mRequest = GpuiLocalAuth.pending();
+        if (mRequest == null) {
+            // Recreated after process death: nobody is waiting any more.
+            finish();
+            return;
+        }
+        String reason = mRequest.reason;
         if (reason == null || reason.isEmpty()) {
             reason = "Verify your identity";
         }
@@ -39,8 +48,7 @@ public class GpuiAuthActivity extends FragmentActivity {
                 @Override
                 public void onAuthenticationSucceeded(@NonNull BiometricPrompt.AuthenticationResult result) {
                     super.onAuthenticationSucceeded(result);
-                    GpuiLocalAuth.sResult.set(0); // success
-                    deliverResult();
+                    deliverResult(0); // success
                     finish();
                 }
 
@@ -58,6 +66,7 @@ public class GpuiAuthActivity extends FragmentActivity {
                     switch (errorCode) {
                         case BiometricPrompt.ERROR_USER_CANCELED:
                         case BiometricPrompt.ERROR_NEGATIVE_BUTTON:
+                        case BiometricPrompt.ERROR_CANCELED: // e.g. the app went to the background
                             result = 4; // cancelled
                             break;
                         case BiometricPrompt.ERROR_LOCKOUT:
@@ -78,25 +87,24 @@ public class GpuiAuthActivity extends FragmentActivity {
                             result = 7; // other
                             break;
                     }
-                    GpuiLocalAuth.sResult.set(result);
-                    deliverResult();
+                    deliverResult(result);
                     finish();
                 }
             });
 
-        biometricPrompt.authenticate(promptInfo);
+        // After a configuration change the prompt is still showing; the new
+        // BiometricPrompt above only reconnects its callback.
+        if (savedInstanceState == null) biometricPrompt.authenticate(promptInfo);
     }
 
     @Override
-    public void onBackPressed() {
-        GpuiLocalAuth.sResult.set(4); // cancelled
-        deliverResult();
-        super.onBackPressed();
+    protected void onDestroy() {
+        // Gone without a result, e.g. the task brought to front from the launcher.
+        if (isFinishing()) deliverResult(4); // cancelled
+        super.onDestroy();
     }
 
-    private void deliverResult() {
-        if (GpuiLocalAuth.sLatch != null) {
-            GpuiLocalAuth.sLatch.countDown();
-        }
+    private void deliverResult(int result) {
+        if (mRequest != null) mRequest.complete(result);
     }
 }

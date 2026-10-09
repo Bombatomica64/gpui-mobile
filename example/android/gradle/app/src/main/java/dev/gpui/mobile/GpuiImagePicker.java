@@ -8,13 +8,13 @@ import android.provider.MediaStore;
 
 import java.io.File;
 import java.util.ArrayList;
-import java.util.concurrent.CountDownLatch;
 
 /**
  * Image/video picker helper for gallery selection and camera capture.
  *
  * <p>All public methods are static and called from Rust via JNI.
- * They block the calling thread until the user completes or cancels the picker.</p>
+ * They block the calling thread, which must not be the UI thread, until the user
+ * completes or cancels the picker.</p>
  */
 public final class GpuiImagePicker {
 
@@ -34,7 +34,7 @@ public final class GpuiImagePicker {
      * @param cameraFacing 0 = rear, 1 = front.
      * @return The image URI/path as a string, or null if cancelled.
      */
-    public static String pickImage(final Activity activity, int source, int cameraFacing) {
+    public static String pickImage(final Activity activity, int source, int cameraFacing) throws Exception {
         Intent intent;
         if (source == SOURCE_CAMERA) {
             intent = new Intent(MediaStore.ACTION_IMAGE_CAPTURE);
@@ -61,7 +61,7 @@ public final class GpuiImagePicker {
      * @param activity The current Activity.
      * @return Array of image URIs, or null if cancelled.
      */
-    public static String[] pickMultiImage(final Activity activity) {
+    public static String[] pickMultiImage(final Activity activity) throws Exception {
         Intent intent = new Intent(Intent.ACTION_PICK, MediaStore.Images.Media.EXTERNAL_CONTENT_URI);
         intent.setType("image/*");
         intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
@@ -81,7 +81,7 @@ public final class GpuiImagePicker {
      * @param cameraFacing 0 = rear, 1 = front.
      * @return The video URI/path as a string, or null if cancelled.
      */
-    public static String pickVideo(final Activity activity, int source, int cameraFacing) {
+    public static String pickVideo(final Activity activity, int source, int cameraFacing) throws Exception {
         Intent intent;
         if (source == SOURCE_CAMERA) {
             intent = new Intent(MediaStore.ACTION_VIDEO_CAPTURE);
@@ -104,24 +104,8 @@ public final class GpuiImagePicker {
 
     // ── Internal ─────────────────────────────────────────────────────────
 
-    private static ArrayList<String> launchPicker(Activity activity, Intent intent) {
-        CountDownLatch latch = new CountDownLatch(1);
-        GpuiPickerActivity.sLatch = latch;
-        GpuiPickerActivity.sResult.set(null);
-        GpuiPickerActivity.sPendingIntent = intent;
-
-        Intent proxy = new Intent(activity, GpuiPickerActivity.class);
-        proxy.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-        activity.startActivity(proxy);
-
-        try {
-            latch.await();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            return null;
-        }
-
-        return GpuiPickerActivity.sResult.get();
+    private static ArrayList<String> launchPicker(Activity activity, Intent intent) throws Exception {
+        return GpuiPickerActivity.launch(activity, intent);
     }
 
     private GpuiImagePicker() {}

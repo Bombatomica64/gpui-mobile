@@ -78,6 +78,10 @@ pub fn get_available_biometrics() -> Result<Vec<BiometricType>, String> {
 }
 
 pub fn authenticate(reason: &str) -> Result<AuthResult, String> {
+    // Only the prompt waits for the user; without usable biometrics Java returns at once.
+    if can_authenticate()? {
+        jni_helpers::ensure_may_wait_for_user("local_auth::authenticate")?;
+    }
     jni_helpers::with_env(|env| {
         let activity = jni_helpers::activity(env)?;
         let cls = jni_helpers::find_app_class(env, HELPER_CLASS)?;

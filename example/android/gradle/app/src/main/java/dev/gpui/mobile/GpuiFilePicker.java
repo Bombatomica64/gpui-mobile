@@ -6,13 +6,13 @@ import android.net.Uri;
 import android.provider.DocumentsContract;
 
 import java.util.ArrayList;
-import java.util.concurrent.CountDownLatch;
 
 /**
  * File picker helper using the Storage Access Framework.
  *
  * <p>All public methods are static and called from Rust via JNI.
- * They block the calling thread until the user completes or cancels the picker.</p>
+ * They block the calling thread, which must not be the UI thread, until the user
+ * completes or cancels the picker.</p>
  */
 public final class GpuiFilePicker {
 
@@ -23,7 +23,7 @@ public final class GpuiFilePicker {
      * @param mimeTypes Pipe-separated MIME types (e.g. "image/jpeg|image/png") or "*\/*" for all.
      * @return The selected file URI as a string, or null if cancelled.
      */
-    public static String openFile(final Activity activity, final String mimeTypes) {
+    public static String openFile(final Activity activity, final String mimeTypes) throws Exception {
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
         intent.addCategory(Intent.CATEGORY_OPENABLE);
         applyMimeTypes(intent, mimeTypes);
@@ -42,7 +42,7 @@ public final class GpuiFilePicker {
      * @param mimeTypes Pipe-separated MIME types.
      * @return Array of selected file URIs, or null if cancelled.
      */
-    public static String[] openFiles(final Activity activity, final String mimeTypes) {
+    public static String[] openFiles(final Activity activity, final String mimeTypes) throws Exception {
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
         intent.addCategory(Intent.CATEGORY_OPENABLE);
         intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
@@ -63,7 +63,7 @@ public final class GpuiFilePicker {
      * @param suggestedName Suggested file name.
      * @return The chosen save URI as a string, or null if cancelled.
      */
-    public static String getSavePath(final Activity activity, final String mimeType, final String suggestedName) {
+    public static String getSavePath(final Activity activity, final String mimeType, final String suggestedName) throws Exception {
         Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
         intent.addCategory(Intent.CATEGORY_OPENABLE);
         intent.setType(mimeType != null ? mimeType : "*/*");
@@ -84,7 +84,7 @@ public final class GpuiFilePicker {
      * @param activity The current Activity.
      * @return The chosen directory URI as a string, or null if cancelled.
      */
-    public static String getDirectoryPath(final Activity activity) {
+    public static String getDirectoryPath(final Activity activity) throws Exception {
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
 
         ArrayList<String> result = launchPicker(activity, intent);
@@ -96,24 +96,8 @@ public final class GpuiFilePicker {
 
     // ── Internal ─────────────────────────────────────────────────────────
 
-    private static ArrayList<String> launchPicker(Activity activity, Intent intent) {
-        CountDownLatch latch = new CountDownLatch(1);
-        GpuiPickerActivity.sLatch = latch;
-        GpuiPickerActivity.sResult.set(null);
-        GpuiPickerActivity.sPendingIntent = intent;
-
-        Intent proxy = new Intent(activity, GpuiPickerActivity.class);
-        proxy.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-        activity.startActivity(proxy);
-
-        try {
-            latch.await();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            return null;
-        }
-
-        return GpuiPickerActivity.sResult.get();
+    private static ArrayList<String> launchPicker(Activity activity, Intent intent) throws Exception {
+        return GpuiPickerActivity.launch(activity, intent);
     }
 
     private static void applyMimeTypes(Intent intent, String mimeTypes) {

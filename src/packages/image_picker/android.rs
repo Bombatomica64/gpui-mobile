@@ -5,6 +5,7 @@ use jni::objects::{JObject, JValue};
 const HELPER_CLASS: &str = "dev.gpui.mobile.GpuiImagePicker";
 
 pub fn pick_image(options: &ImagePickerOptions) -> Result<Option<PickedFile>, String> {
+    jni_helpers::ensure_may_wait_for_user("image_picker::pick_image")?;
     jni_helpers::with_env(|env| {
         let activity = jni_helpers::activity(env)?;
         let cls = jni_helpers::find_app_class(env, HELPER_CLASS)?;
@@ -47,6 +48,7 @@ pub fn pick_multi_image(
     _max_height: Option<f64>,
     _image_quality: Option<u8>,
 ) -> Result<Vec<PickedFile>, String> {
+    jni_helpers::ensure_may_wait_for_user("image_picker::pick_multi_image")?;
     jni_helpers::with_env(|env| {
         let activity = jni_helpers::activity(env)?;
         let cls = jni_helpers::find_app_class(env, HELPER_CLASS)?;
@@ -82,6 +84,7 @@ pub fn pick_video(
     source: ImageSource,
     preferred_camera: CameraDevice,
 ) -> Result<Option<PickedFile>, String> {
+    jni_helpers::ensure_may_wait_for_user("image_picker::pick_video")?;
     jni_helpers::with_env(|env| {
         let activity = jni_helpers::activity(env)?;
         let cls = jni_helpers::find_app_class(env, HELPER_CLASS)?;
