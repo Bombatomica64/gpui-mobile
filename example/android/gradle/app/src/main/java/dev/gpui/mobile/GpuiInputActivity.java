@@ -33,6 +33,23 @@ public class GpuiInputActivity extends NativeActivity {
     }
 
     public void gpuiShowKeyboard(int keyboardType, long session) {
+        int type = InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE;
+        switch (keyboardType) {
+            case 1: type = InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS; break;
+            case 2: type = InputType.TYPE_CLASS_PHONE; break;
+            case 3: type = InputType.TYPE_CLASS_NUMBER; break;
+            case 4: type = InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI; break;
+            case 5: type = InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL; break;
+        }
+        showKeyboard(type, EditorInfo.IME_FLAG_NO_EXTRACT_UI, session, false);
+    }
+
+    /** The focused field's EditorInfo, from GPUI's TextInputConfiguration. */
+    public void gpuiShowKeyboardWithInputType(int inputType, int imeOptions, long session) {
+        showKeyboard(inputType, imeOptions, session, true);
+    }
+
+    private void showKeyboard(int inputType, int imeOptions, long session, boolean reportsActions) {
         runOnUiThread(() -> {
             if (input == null) {
                 input = new InputProxy();
@@ -41,16 +58,9 @@ public class GpuiInputActivity extends NativeActivity {
                 addContentView(input, new ViewGroup.LayoutParams(1, 1));
             }
             input.reset(session);
-            int type = InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE;
-            switch (keyboardType) {
-                case 1: type = InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS; break;
-                case 2: type = InputType.TYPE_CLASS_PHONE; break;
-                case 3: type = InputType.TYPE_CLASS_NUMBER; break;
-                case 4: type = InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI; break;
-                case 5: type = InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL; break;
-            }
-            input.setInputType(type);
-            input.setImeOptions(EditorInfo.IME_FLAG_NO_EXTRACT_UI);
+            input.reportsActions = reportsActions;
+            input.setInputType(inputType);
+            input.setImeOptions(imeOptions);
             input.requestFocus();
             InputMethodManager imm = (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
             imm.restartInput(input);
@@ -80,6 +90,8 @@ public class GpuiInputActivity extends NativeActivity {
         private long session;
         private int depth;
         private boolean marked;
+        /** Report the keyboard's action key as IME event 6 instead of a Done / newline. */
+        boolean reportsActions;
 
         InputProxy() {
             super(GpuiInputActivity.this);
@@ -132,6 +144,15 @@ public class GpuiInputActivity extends NativeActivity {
                 nativeIme(session, 5, "", 0, 0);
             }
             return super.onKeyPreIme(code, event);
+        }
+
+        // Both the IME's action key and a hardware Enter on a single-line field end up here.
+        @Override public void onEditorAction(int action) {
+            if (reportsActions) {
+                nativeIme(session, 6, "", action, 0);
+            } else {
+                super.onEditorAction(action);
+            }
         }
 
         @Override public InputConnection onCreateInputConnection(EditorInfo info) {
@@ -207,13 +228,25 @@ public class GpuiInputActivity extends NativeActivity {
                         return true;
                     }
                     if (event.getKeyCode() == KeyEvent.KEYCODE_ENTER) {
-                        if (event.getAction() == KeyEvent.ACTION_DOWN) commitText("\n", 1);
+                        if (event.getAction() == KeyEvent.ACTION_DOWN) {
+                            int action = getImeOptions() & EditorInfo.IME_MASK_ACTION;
+                            if (reportsActions && action != EditorInfo.IME_ACTION_UNSPECIFIED) {
+                                performEditorAction(action);
+                            } else {
+                                commitText("\n", 1);
+                            }
+                        }
                         return true;
                     }
                     return super.sendKeyEvent(event);
                 }
                 @Override public boolean performEditorAction(int action) {
                     if (connectionSession != session) return false;
+                    if (reportsActions) {
+                        finishComposingText();
+                        onEditorAction(action);
+                        return true;
+                    }
                     if (action == EditorInfo.IME_ACTION_DONE) {
                         finishComposingText();
                         nativeIme(session, 4, "", 0, 0);

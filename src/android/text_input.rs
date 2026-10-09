@@ -1,6 +1,7 @@
 //! UI-thread IME events are queued, then applied on GPUI's native thread.
 
-use gpui::PlatformInputHandler;
+use super::keyboard::{android_key_to_keystroke, AKEYCODE_ENTER};
+use gpui::{KeyDownEvent, KeyUpEvent, PlatformInput, PlatformInputHandler};
 use parking_lot::Mutex;
 use std::{
     cell::RefCell,
@@ -35,10 +36,34 @@ pub(super) fn enqueue(event: ImeEvent) {
     }
 }
 
-pub(super) fn drain(slot: &Rc<RefCell<Option<PlatformInputHandler>>>) {
+/// Apply queued IME events to the focused input. `dispatch` delivers the key
+/// events an editor action turns into.
+pub(super) fn drain(
+    slot: &Rc<RefCell<Option<PlatformInputHandler>>>,
+    mut dispatch: impl FnMut(PlatformInput),
+) {
     let events = std::mem::take(&mut *EVENTS.lock());
     for event in events {
         if event.session != SESSION.load(Ordering::Acquire) {
+            continue;
+        }
+        if event.kind == 6 {
+            // The keyboard's action key (Done, Search, Send, Next…) on a single-line
+            // field, `start` holding the `IME_ACTION_*`. The field sees it as its enter
+            // key, as with a hardware keyboard; Done-like actions then put the keyboard
+            // away, keeping focus as for 4.
+            finish_composition(slot);
+            if let Some(keystroke) = android_key_to_keystroke(AKEYCODE_ENTER, 0, 0) {
+                dispatch(PlatformInput::KeyDown(KeyDownEvent {
+                    keystroke: keystroke.clone(),
+                    is_held: false,
+                    prefer_character_input: false,
+                }));
+                dispatch(PlatformInput::KeyUp(KeyUpEvent { keystroke }));
+            }
+            if super::input_type::action_dismisses_keyboard(event.start as i32) {
+                super::jni::keyboard_done();
+            }
             continue;
         }
         if event.kind == 5 {
