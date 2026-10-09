@@ -111,7 +111,27 @@ public class GpuiInputActivity extends NativeActivity {
                 nativeIme(session, 3, "", 1, 0);
                 return true;
             }
+            // A single-line TextView turns a hardware Enter into a focus move, not
+            // its editor action.
+            if (code == KeyEvent.KEYCODE_ENTER && editorAction() != EditorInfo.IME_ACTION_UNSPECIFIED) {
+                onEditorAction(editorAction());
+                return true;
+            }
             return super.onKeyDown(code, event);
+        }
+
+        @Override public boolean onKeyUp(int code, KeyEvent event) {
+            if (code == KeyEvent.KEYCODE_ENTER && editorAction() != EditorInfo.IME_ACTION_UNSPECIFIED) {
+                return true;
+            }
+            return super.onKeyUp(code, event);
+        }
+
+        /** The action of a single-line field reported as IME event 6, or UNSPECIFIED. */
+        int editorAction() {
+            return reportsActions
+                    ? getImeOptions() & EditorInfo.IME_MASK_ACTION
+                    : EditorInfo.IME_ACTION_UNSPECIFIED;
         }
 
         void reset(long nextSession) {
@@ -229,8 +249,8 @@ public class GpuiInputActivity extends NativeActivity {
                     }
                     if (event.getKeyCode() == KeyEvent.KEYCODE_ENTER) {
                         if (event.getAction() == KeyEvent.ACTION_DOWN) {
-                            int action = getImeOptions() & EditorInfo.IME_MASK_ACTION;
-                            if (reportsActions && action != EditorInfo.IME_ACTION_UNSPECIFIED) {
+                            int action = editorAction();
+                            if (action != EditorInfo.IME_ACTION_UNSPECIFIED) {
                                 performEditorAction(action);
                             } else {
                                 commitText("\n", 1);
