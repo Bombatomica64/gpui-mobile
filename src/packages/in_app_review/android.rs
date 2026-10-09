@@ -1,67 +1,121 @@
-use crate::android::jni::{self as jni_helpers, JniExt};
+use crate::android::jni::{self as jni_helpers, get_string, JniExt, JniResultExt as _};
 use jni::objects::JValue;
 
-const HELPER_CLASS: &str = "dev.gpui.mobile.GpuiInAppReview";
-
+/// Whether the Play Store is installed.
 pub fn is_available() -> Result<bool, String> {
     jni_helpers::with_env(|env| {
-        let activity = jni_helpers::activity(env)?;
-        let cls = jni_helpers::find_app_class(env, HELPER_CLASS)?;
-        let result = env
-            .call_static_method(
-                &cls,
-                jni::jni_str!("isAvailable"),
-                jni::jni_sig!("(Landroid/app/Activity;)Z"),
-                &[JValue::Object(&activity)],
+        let context = jni_helpers::application_context(env)?;
+        let pm = env
+            .call_method(
+                &context,
+                jni::jni_str!("getPackageManager"),
+                jni::jni_sig!("()Landroid/content/pm/PackageManager;"),
+                &[],
             )
-            .and_then(|v| v.z())
-            .e()?;
-
-        Ok(result)
+            .and_then(|v| v.l())
+            .or_clear(env)?;
+        let package = env.new_string("com.android.vending").e()?;
+        let info = env
+            .call_method(
+                &pm,
+                jni::jni_str!("getPackageInfo"),
+                jni::jni_sig!("(Ljava/lang/String;I)Landroid/content/pm/PackageInfo;"),
+                &[JValue::Object(&package), JValue::Int(0)],
+            )
+            .or_catch(
+                env,
+                jni::jni_str!("android/content/pm/PackageManager$NameNotFoundException"),
+            )?;
+        // NameNotFoundException: not installed (or not visible without a <queries>
+        // entry on API 30+).
+        Ok(info.is_some())
     })
 }
 
+/// Open this app's Play Store page.
 pub fn request_review() -> Result<(), String> {
-    jni_helpers::with_env(|env| {
-        let activity = jni_helpers::activity(env)?;
-        let cls = jni_helpers::find_app_class(env, HELPER_CLASS)?;
-        let success = env
-            .call_static_method(
-                &cls,
-                jni::jni_str!("requestReview"),
-                jni::jni_sig!("(Landroid/app/Activity;)Z"),
-                &[JValue::Object(&activity)],
+    let package = jni_helpers::with_env(|env| {
+        let context = jni_helpers::application_context(env)?;
+        let package = env
+            .call_method(
+                &context,
+                jni::jni_str!("getPackageName"),
+                jni::jni_sig!("()Ljava/lang/String;"),
+                &[],
             )
-            .and_then(|v| v.z())
-            .e()?;
-
-        if success {
-            Ok(())
-        } else {
-            Err("Failed to launch review flow".into())
-        }
-    })
+            .and_then(|v| v.l())
+            .or_clear(env)?;
+        Ok(get_string(env, &package))
+    })?;
+    if open_store_page(&package)? {
+        Ok(())
+    } else {
+        Err("Failed to launch review flow".into())
+    }
 }
 
 pub fn open_store_listing(app_id: &str) -> Result<(), String> {
+    if open_store_page(app_id)? {
+        Ok(())
+    } else {
+        Err("Failed to open store listing".into())
+    }
+}
+
+/// Open `app_id`'s page in the Play Store app, or on the web if that fails for any
+/// reason.
+fn open_store_page(app_id: &str) -> Result<bool, String> {
+    let in_store = view(&format!("market://details?id={app_id}")).unwrap_or_else(|err| {
+        log::debug!("in_app_review: market:// failed, trying the web: {err}");
+        false
+    });
+    Ok(in_store
+        || view(&format!(
+            "https://play.google.com/store/apps/details?id={app_id}"
+        ))?)
+}
+
+/// Start an `ACTION_VIEW` intent for `uri` in a new task. `false` if no app takes it.
+fn view(uri: &str) -> Result<bool, String> {
     jni_helpers::with_env(|env| {
         let activity = jni_helpers::activity(env)?;
-        let cls = jni_helpers::find_app_class(env, HELPER_CLASS)?;
-        let j_app_id = env.new_string(app_id).e()?;
-        let success = env
+        let action = env.new_string("android.intent.action.VIEW").e()?;
+        let uri = env.new_string(uri).e()?;
+        let uri = env
             .call_static_method(
-                &cls,
-                jni::jni_str!("openStoreListing"),
-                jni::jni_sig!("(Landroid/app/Activity;Ljava/lang/String;)Z"),
-                &[JValue::Object(&activity), JValue::Object(&j_app_id)],
+                jni::jni_str!("android/net/Uri"),
+                jni::jni_str!("parse"),
+                jni::jni_sig!("(Ljava/lang/String;)Landroid/net/Uri;"),
+                &[JValue::Object(&uri)],
             )
-            .and_then(|v| v.z())
-            .e()?;
-
-        if success {
-            Ok(())
-        } else {
-            Err("Failed to open store listing".into())
-        }
+            .and_then(|v| v.l())
+            .or_clear(env)?;
+        let intent = env
+            .new_object(
+                jni::jni_str!("android/content/Intent"),
+                jni::jni_sig!("(Ljava/lang/String;Landroid/net/Uri;)V"),
+                &[JValue::Object(&action), JValue::Object(&uri)],
+            )
+            .or_clear(env)?;
+        const FLAG_ACTIVITY_NEW_TASK: i32 = 0x1000_0000;
+        env.call_method(
+            &intent,
+            jni::jni_str!("addFlags"),
+            jni::jni_sig!("(I)Landroid/content/Intent;"),
+            &[JValue::Int(FLAG_ACTIVITY_NEW_TASK)],
+        )
+        .or_clear(env)?;
+        let started = env
+            .call_method(
+                &activity,
+                jni::jni_str!("startActivity"),
+                jni::jni_sig!("(Landroid/content/Intent;)V"),
+                &[JValue::Object(&intent)],
+            )
+            .or_catch(
+                env,
+                jni::jni_str!("android/content/ActivityNotFoundException"),
+            )?;
+        Ok(started.is_some())
     })
 }

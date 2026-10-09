@@ -1,5 +1,5 @@
 use super::VideoInfo;
-use crate::android::jni::{self as jni_helpers, JniExt};
+use crate::android::jni::{self as jni_helpers, JniExt, JniResultExt as _};
 use jni::objects::{JObject, JValue};
 
 const HELPER_CLASS: &str = "dev.gpui.mobile.GpuiVideoPlayer";
@@ -18,10 +18,7 @@ pub fn create_player() -> Result<u32, String> {
                 &[JValue::Object(&activity)],
             )
             .and_then(|v| v.i())
-            .map_err(|e| {
-                env.exception_clear();
-                e.to_string()
-            })?;
+            .or_clear(env)?;
 
         if id <= 0 {
             return Err("GpuiVideoPlayer.create failed".into());
@@ -48,10 +45,7 @@ pub fn set_url(id: u32, url: &str) -> Result<VideoInfo, String> {
                 ],
             )
             .and_then(|v| v.l())
-            .map_err(|e| {
-                env.exception_clear();
-                e.to_string()
-            })?;
+            .or_clear(env)?;
 
         parse_video_info(env, &result)
     })
@@ -75,10 +69,7 @@ pub fn set_file_path(id: u32, path: &str) -> Result<VideoInfo, String> {
                 ],
             )
             .and_then(|v| v.l())
-            .map_err(|e| {
-                env.exception_clear();
-                e.to_string()
-            })?;
+            .or_clear(env)?;
 
         parse_video_info(env, &result)
     })
@@ -93,10 +84,7 @@ pub fn play(id: u32) -> Result<(), String> {
             jni::jni_sig!("(I)V"),
             &[JValue::Int(id as i32)],
         )
-        .map_err(|e| {
-            env.exception_clear();
-            e.to_string()
-        })?;
+        .or_clear(env)?;
         Ok(())
     })
 }
@@ -110,10 +98,7 @@ pub fn pause(id: u32) -> Result<(), String> {
             jni::jni_sig!("(I)V"),
             &[JValue::Int(id as i32)],
         )
-        .map_err(|e| {
-            env.exception_clear();
-            e.to_string()
-        })?;
+        .or_clear(env)?;
         Ok(())
     })
 }
@@ -127,10 +112,7 @@ pub fn seek(id: u32, position_ms: u64) -> Result<(), String> {
             jni::jni_sig!("(IJ)V"),
             &[JValue::Int(id as i32), JValue::Long(position_ms as i64)],
         )
-        .map_err(|e| {
-            env.exception_clear();
-            e.to_string()
-        })?;
+        .or_clear(env)?;
         Ok(())
     })
 }
@@ -144,10 +126,7 @@ pub fn set_volume(id: u32, volume: f32) -> Result<(), String> {
             jni::jni_sig!("(IF)V"),
             &[JValue::Int(id as i32), JValue::Float(volume)],
         )
-        .map_err(|e| {
-            env.exception_clear();
-            e.to_string()
-        })?;
+        .or_clear(env)?;
         Ok(())
     })
 }
@@ -161,10 +140,7 @@ pub fn set_speed(id: u32, speed: f32) -> Result<(), String> {
             jni::jni_sig!("(IF)V"),
             &[JValue::Int(id as i32), JValue::Float(speed)],
         )
-        .map_err(|e| {
-            env.exception_clear();
-            e.to_string()
-        })?;
+        .or_clear(env)?;
         Ok(())
     })
 }
@@ -178,10 +154,7 @@ pub fn set_looping(id: u32, looping: bool) -> Result<(), String> {
             jni::jni_sig!("(IZ)V"),
             &[JValue::Int(id as i32), JValue::Bool(looping)],
         )
-        .map_err(|e| {
-            env.exception_clear();
-            e.to_string()
-        })?;
+        .or_clear(env)?;
         Ok(())
     })
 }
@@ -197,10 +170,7 @@ pub fn position(id: u32) -> Result<u64, String> {
                 &[JValue::Int(id as i32)],
             )
             .and_then(|v| v.j())
-            .map_err(|e| {
-                env.exception_clear();
-                e.to_string()
-            })?;
+            .or_clear(env)?;
         Ok(pos.max(0) as u64)
     })
 }
@@ -216,10 +186,7 @@ pub fn duration(id: u32) -> Result<u64, String> {
                 &[JValue::Int(id as i32)],
             )
             .and_then(|v| v.j())
-            .map_err(|e| {
-                env.exception_clear();
-                e.to_string()
-            })?;
+            .or_clear(env)?;
         Ok(dur.max(0) as u64)
     })
 }
@@ -236,10 +203,7 @@ pub fn video_size(id: u32) -> Result<(u32, u32), String> {
                 &[JValue::Int(id as i32)],
             )
             .and_then(|v| v.i())
-            .map_err(|e| {
-                env.exception_clear();
-                e.to_string()
-            })?;
+            .or_clear(env)?;
 
         let h = env
             .call_static_method(
@@ -249,10 +213,7 @@ pub fn video_size(id: u32) -> Result<(u32, u32), String> {
                 &[JValue::Int(id as i32)],
             )
             .and_then(|v| v.i())
-            .map_err(|e| {
-                env.exception_clear();
-                e.to_string()
-            })?;
+            .or_clear(env)?;
 
         Ok((w.max(0) as u32, h.max(0) as u32))
     })
@@ -269,10 +230,7 @@ pub fn is_playing(id: u32) -> Result<bool, String> {
                 &[JValue::Int(id as i32)],
             )
             .and_then(|v| v.z())
-            .map_err(|e| {
-                env.exception_clear();
-                e.to_string()
-            })?;
+            .or_clear(env)?;
         Ok(playing)
     })
 }
@@ -286,10 +244,7 @@ pub fn dispose(id: u32) -> Result<(), String> {
             jni::jni_sig!("(I)V"),
             &[JValue::Int(id as i32)],
         )
-        .map_err(|e| {
-            env.exception_clear();
-            e.to_string()
-        })?;
+        .or_clear(env)?;
         Ok(())
     })
 }

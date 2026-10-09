@@ -1,5 +1,5 @@
 use super::{BarometerData, SensorAvailability, SensorData};
-use crate::android::jni as jni_helpers;
+use crate::android::jni::{self as jni_helpers, JniExt, JniResultExt as _};
 use jni::objects::JValue;
 
 // Android Sensor.TYPE_* constants
@@ -10,21 +10,21 @@ const TYPE_PRESSURE: i32 = 6;
 
 pub fn available_sensors() -> SensorAvailability {
     jni_helpers::with_env(|env| {
-        let activity = jni_helpers::activity(env)?;
-
-        let sm = match get_sensor_manager(env, &activity) {
-            Some(sm) => sm,
-            None => return Ok(SensorAvailability::default()),
+        let context = jni_helpers::application_context(env)?;
+        let Some(sm) = get_sensor_manager(env, &context)? else {
+            return Ok(SensorAvailability::default());
         };
-
         Ok(SensorAvailability {
-            accelerometer: has_sensor(env, &sm, TYPE_ACCELEROMETER),
-            gyroscope: has_sensor(env, &sm, TYPE_GYROSCOPE),
-            magnetometer: has_sensor(env, &sm, TYPE_MAGNETIC_FIELD),
-            barometer: has_sensor(env, &sm, TYPE_PRESSURE),
+            accelerometer: has_sensor(env, &sm, TYPE_ACCELEROMETER)?,
+            gyroscope: has_sensor(env, &sm, TYPE_GYROSCOPE)?,
+            magnetometer: has_sensor(env, &sm, TYPE_MAGNETIC_FIELD)?,
+            barometer: has_sensor(env, &sm, TYPE_PRESSURE)?,
         })
     })
-    .unwrap_or_default()
+    .unwrap_or_else(|err| {
+        log::warn!("available_sensors: {err}");
+        SensorAvailability::default()
+    })
 }
 
 pub fn accelerometer() -> Option<SensorData> {
@@ -48,30 +48,30 @@ pub fn barometer() -> Option<BarometerData> {
     None
 }
 
+/// The `SensorManager`, or `None` if the device has none.
 fn get_sensor_manager<'local>(
     env: &mut jni::Env<'local>,
-    activity: &jni::objects::JObject<'_>,
-) -> Option<jni::objects::JObject<'local>> {
-    let service_name = env.new_string("sensor").ok()?;
+    context: &jni::objects::JObject<'_>,
+) -> Result<Option<jni::objects::JObject<'local>>, String> {
+    let service_name = env.new_string("sensor").e()?;
     let sm = env
         .call_method(
-            activity,
+            context,
             jni::jni_str!("getSystemService"),
             jni::jni_sig!("(Ljava/lang/String;)Ljava/lang/Object;"),
             &[JValue::Object(&service_name)],
         )
         .and_then(|v| v.l())
-        .ok()?;
-    if sm.is_null() {
-        env.exception_clear();
-        None
-    } else {
-        Some(sm)
-    }
+        .or_clear(env)?;
+    Ok((!sm.is_null()).then_some(sm))
 }
 
-fn has_sensor(env: &mut jni::Env<'_>, sm: &jni::objects::JObject<'_>, sensor_type: i32) -> bool {
-    match env
+fn has_sensor(
+    env: &mut jni::Env<'_>,
+    sm: &jni::objects::JObject<'_>,
+    sensor_type: i32,
+) -> Result<bool, String> {
+    let sensor = env
         .call_method(
             sm,
             jni::jni_str!("getDefaultSensor"),
@@ -79,11 +79,6 @@ fn has_sensor(env: &mut jni::Env<'_>, sm: &jni::objects::JObject<'_>, sensor_typ
             &[JValue::Int(sensor_type)],
         )
         .and_then(|v| v.l())
-    {
-        Ok(sensor) => !sensor.is_null(),
-        Err(_) => {
-            env.exception_clear();
-            false
-        }
-    }
+        .or_clear(env)?;
+    Ok(!sensor.is_null())
 }

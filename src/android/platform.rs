@@ -66,10 +66,9 @@ use gpui_wgpu::GpuContext;
 
 /// Android clipboard.
 ///
-/// With the `clipboard` feature this goes through the system `ClipboardManager`
-/// (`dev.gpui.mobile.GpuiClipboard`), so text copied in GPUI can be pasted in other
-/// apps and vice versa. Without the feature, or when the JNI call fails (the host did
-/// not package `GpuiClipboard.java`), it falls back to an in-process string store.
+/// With the `clipboard` feature this goes through the system `ClipboardManager`, so
+/// text copied in GPUI can be pasted in other apps and vice versa. Without the
+/// feature, or when the JNI call fails, it falls back to an in-process string store.
 #[derive(Default)]
 pub struct AndroidClipboard {
     contents: Option<String>,
@@ -769,23 +768,23 @@ impl AndroidPlatform {
     ///
     /// Returns `None` if the JNI environment is unavailable or the call fails.
     fn query_keyboard_layout_id_via_jni(&self) -> Option<String> {
-        use crate::android::jni::{self as jni_helpers, get_string};
+        use crate::android::jni::{self as jni_helpers, get_string, JniResultExt as _};
         use jni::objects::JValue;
 
         jni_helpers::with_env(|env| {
-            let activity = jni_helpers::activity(env)?;
+            let context = jni_helpers::application_context(env)?;
 
-            // activity.getSystemService("input_method")
-            let service_name = env.new_string("input_method").map_err(|e| e.to_string())?;
+            // context.getSystemService("input_method")
+            let service_name = env.new_string("input_method").or_clear(env)?;
             let imm = env
                 .call_method(
-                    &activity,
+                    &context,
                     jni::jni_str!("getSystemService"),
                     jni::jni_sig!("(Ljava/lang/String;)Ljava/lang/Object;"),
                     &[JValue::Object(&service_name)],
                 )
                 .and_then(|v| v.l())
-                .map_err(|e| e.to_string())?;
+                .or_clear(env)?;
             if imm.is_null() {
                 return Ok(None);
             }
@@ -799,7 +798,7 @@ impl AndroidPlatform {
                     &[],
                 )
                 .and_then(|v| v.l())
-                .map_err(|e| e.to_string())?;
+                .or_clear(env)?;
             if subtype.is_null() {
                 return Ok(None);
             }
@@ -813,7 +812,7 @@ impl AndroidPlatform {
                     &[],
                 )
                 .and_then(|v| v.l())
-                .map_err(|e| e.to_string())?;
+                .or_clear(env)?;
 
             let result = get_string(env, &locale_obj).replace('_', "-");
             if result.is_empty() {
@@ -872,32 +871,29 @@ impl AndroidPlatform {
     /// Returns -1 on failure (JNI unavailable, API < 29, etc.).
     #[allow(dead_code)]
     fn query_thermal_status_via_jni(&self) -> i32 {
-        use crate::android::jni as jni_helpers;
+        use crate::android::jni::{self as jni_helpers, JniResultExt as _};
         use jni::objects::JValue;
 
         jni_helpers::with_env(|env| {
-            let activity = jni_helpers::activity(env)?;
+            let context = jni_helpers::application_context(env)?;
 
-            // activity.getSystemService("power")
-            let service_name = env.new_string("power").map_err(|e| e.to_string())?;
-            let pm = match env
+            // context.getSystemService("power")
+            let service_name = env.new_string("power").or_clear(env)?;
+            let pm = env
                 .call_method(
-                    &activity,
+                    &context,
                     jni::jni_str!("getSystemService"),
                     jni::jni_sig!("(Ljava/lang/String;)Ljava/lang/Object;"),
                     &[JValue::Object(&service_name)],
                 )
                 .and_then(|v| v.l())
-            {
-                Ok(o) if !o.is_null() => o,
-                _ => {
-                    env.exception_clear();
-                    return Err("getSystemService(power) failed or returned null".to_string());
-                }
-            };
+                .or_clear(env)?;
+            if pm.is_null() {
+                return Err("getSystemService(power) returned null".to_string());
+            }
 
             // pm.getCurrentThermalStatus() — API 29+
-            let status = match env
+            let status = env
                 .call_method(
                     &pm,
                     jni::jni_str!("getCurrentThermalStatus"),
@@ -905,13 +901,7 @@ impl AndroidPlatform {
                     &[],
                 )
                 .and_then(|v| v.i())
-            {
-                Ok(s) => s,
-                Err(_) => {
-                    env.exception_clear();
-                    return Err("getCurrentThermalStatus() failed".to_string());
-                }
-            };
+                .or_clear(env)?;
 
             log::trace!("query_thermal_status_via_jni: status={}", status);
             Ok(status)

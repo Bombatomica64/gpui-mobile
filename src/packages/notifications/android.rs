@@ -1,5 +1,5 @@
 use super::Notification;
-use crate::android::jni::{self as jni_helpers, JniExt};
+use crate::android::jni::{self as jni_helpers, JniExt, JniResultExt as _};
 use jni::objects::JValue;
 
 const HELPER_CLASS: &str = "dev.gpui.mobile.GpuiNotifications";
@@ -15,10 +15,7 @@ pub fn initialize() -> Result<(), String> {
             jni::jni_sig!("(Landroid/app/Activity;)V"),
             &[JValue::Object(&activity)],
         )
-        .map_err(|e| {
-            env.exception_clear();
-            e.to_string()
-        })?;
+        .or_clear(env)?;
 
         Ok(())
     })
@@ -55,11 +52,7 @@ pub fn show(notification: &Notification) -> Result<(), String> {
                 JValue::Int(importance),
                 JValue::Object(&j_payload),
             ],
-        )
-        .map_err(|e| {
-            env.exception_clear();
-            e.to_string()
-        })?;
+        ).or_clear(env)?;
 
         Ok(())
     })
@@ -76,10 +69,7 @@ pub fn cancel(id: i32) -> Result<(), String> {
             jni::jni_sig!("(Landroid/app/Activity;I)V"),
             &[JValue::Object(&activity), JValue::Int(id)],
         )
-        .map_err(|e| {
-            env.exception_clear();
-            e.to_string()
-        })?;
+        .or_clear(env)?;
 
         Ok(())
     })
@@ -96,10 +86,7 @@ pub fn cancel_all() -> Result<(), String> {
             jni::jni_sig!("(Landroid/app/Activity;)V"),
             &[JValue::Object(&activity)],
         )
-        .map_err(|e| {
-            env.exception_clear();
-            e.to_string()
-        })?;
+        .or_clear(env)?;
 
         Ok(())
     })

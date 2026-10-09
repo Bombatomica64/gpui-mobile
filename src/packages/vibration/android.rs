@@ -1,46 +1,47 @@
 use super::HapticFeedback;
-use crate::android::jni::{self as jni_helpers, JniExt};
+use crate::android::jni::{self as jni_helpers, JniExt, JniResultExt as _};
 use jni::objects::{JObject, JValue};
 
 pub fn vibrate(duration_ms: u32) -> Result<(), String> {
     jni_helpers::with_env(|env| {
-        let activity = jni_helpers::activity(env)?;
+        let context = jni_helpers::application_context(env)?;
 
-        let vibrator = get_vibrator_service(env, &activity)?;
+        let vibrator = get_vibrator_service(env, &context)?;
 
-        // Try VibrationEffect.createOneShot (API 26+)
-        if let Ok(ve_cls) = env.find_class(jni::jni_str!("android/os/VibrationEffect")) {
-            if let Ok(effect) = env
-                .call_static_method(
-                    &ve_cls,
-                    jni::jni_str!("createOneShot"),
-                    jni::jni_sig!("(JI)Landroid/os/VibrationEffect;"),
-                    &[JValue::Long(duration_ms as i64), JValue::Int(-1)], // DEFAULT_AMPLITUDE = -1
-                )
-                .and_then(|v| v.l())
-            {
-                if !effect.is_null() {
-                    let _ = env.call_method(
-                        &vibrator,
-                        jni::jni_str!("vibrate"),
-                        jni::jni_sig!("(Landroid/os/VibrationEffect;)V"),
-                        &[JValue::Object(&effect)],
-                    );
-                    env.exception_clear();
-                    return Ok(());
-                }
-            }
-            env.exception_clear();
-        }
-
-        // Fallback: vibrator.vibrate(long) for older APIs
-        let _ = env.call_method(
+        // VibrationEffect.createOneShot (API 26+), or vibrate(long) before it.
+        let effect_class = env
+            .find_class(jni::jni_str!("android/os/VibrationEffect"))
+            .or_catch(env, jni::jni_str!("java/lang/NoClassDefFoundError"))?;
+        let Some(effect_class) = effect_class else {
+            env.call_method(
+                &vibrator,
+                jni::jni_str!("vibrate"),
+                jni::jni_sig!("(J)V"),
+                &[JValue::Long(duration_ms as i64)],
+            )
+            .or_clear(env)?;
+            return Ok(());
+        };
+        const DEFAULT_AMPLITUDE: i32 = -1;
+        let effect = env
+            .call_static_method(
+                &effect_class,
+                jni::jni_str!("createOneShot"),
+                jni::jni_sig!("(JI)Landroid/os/VibrationEffect;"),
+                &[
+                    JValue::Long(duration_ms as i64),
+                    JValue::Int(DEFAULT_AMPLITUDE),
+                ],
+            )
+            .and_then(|v| v.l())
+            .or_clear(env)?;
+        env.call_method(
             &vibrator,
             jni::jni_str!("vibrate"),
-            jni::jni_sig!("(J)V"),
-            &[JValue::Long(duration_ms as i64)],
-        );
-        env.exception_clear();
+            jni::jni_sig!("(Landroid/os/VibrationEffect;)V"),
+            &[JValue::Object(&effect)],
+        )
+        .or_clear(env)?;
         Ok(())
     })
 }
@@ -69,7 +70,7 @@ pub fn haptic_feedback(feedback: HapticFeedback) -> Result<(), String> {
                 &[],
             )
             .and_then(|v| v.l())
-            .e()?;
+            .or_clear(env)?;
         if window.is_null() {
             return Err("getWindow returned null".into());
         }
@@ -82,27 +83,27 @@ pub fn haptic_feedback(feedback: HapticFeedback) -> Result<(), String> {
                 &[],
             )
             .and_then(|v| v.l())
-            .e()?;
+            .or_clear(env)?;
         if decor.is_null() {
             return Err("getDecorView returned null".into());
         }
 
-        let _ = env.call_method(
+        env.call_method(
             &decor,
             jni::jni_str!("performHapticFeedback"),
             jni::jni_sig!("(I)Z"),
             &[JValue::Int(constant)],
-        );
-        env.exception_clear();
+        )
+        .or_clear(env)?;
         Ok(())
     })
 }
 
 pub fn can_vibrate() -> bool {
     jni_helpers::with_env(|env| {
-        let activity = jni_helpers::activity(env)?;
+        let context = jni_helpers::application_context(env)?;
 
-        let vibrator = get_vibrator_service(env, &activity)?;
+        let vibrator = get_vibrator_service(env, &context)?;
 
         let result = env
             .call_method(
@@ -112,26 +113,29 @@ pub fn can_vibrate() -> bool {
                 &[],
             )
             .and_then(|v| v.z())
-            .unwrap_or(false);
+            .or_clear(env)?;
         Ok(result)
     })
-    .unwrap_or(false)
+    .unwrap_or_else(|err| {
+        log::warn!("can_vibrate: {err}");
+        false
+    })
 }
 
 fn get_vibrator_service<'local>(
     env: &mut jni::Env<'local>,
-    activity: &JObject<'_>,
+    context: &JObject<'_>,
 ) -> Result<JObject<'local>, String> {
     let service_name = env.new_string("vibrator").e()?;
     let vibrator = env
         .call_method(
-            activity,
+            context,
             jni::jni_str!("getSystemService"),
             jni::jni_sig!("(Ljava/lang/String;)Ljava/lang/Object;"),
             &[JValue::Object(&service_name)],
         )
         .and_then(|v| v.l())
-        .e()?;
+        .or_clear(env)?;
     if vibrator.is_null() {
         return Err("Vibrator service not available".into());
     }

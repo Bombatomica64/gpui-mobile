@@ -1,5 +1,5 @@
 use super::{OpenFileOptions, SaveFileOptions, SelectedFile};
-use crate::android::jni::{self as jni_helpers, JniExt};
+use crate::android::jni::{self as jni_helpers, JniExt, JniResultExt as _};
 use jni::objects::{JObject, JValue};
 
 const HELPER_CLASS: &str = "dev.gpui.mobile.GpuiFilePicker";
@@ -20,10 +20,7 @@ pub fn open_file(options: &OpenFileOptions) -> Result<Option<SelectedFile>, Stri
                 &[JValue::Object(&activity), JValue::Object(&j_mime)],
             )
             .and_then(|v| v.l())
-            .map_err(|e| {
-                env.exception_clear();
-                e.to_string()
-            })?;
+            .or_clear(env)?;
 
         if result.is_null() {
             return Ok(None);
@@ -51,10 +48,7 @@ pub fn open_files(options: &OpenFileOptions) -> Result<Vec<SelectedFile>, String
                 &[JValue::Object(&activity), JValue::Object(&j_mime)],
             )
             .and_then(|v| v.l())
-            .map_err(|e| {
-                env.exception_clear();
-                e.to_string()
-            })?;
+            .or_clear(env)?;
 
         if result.is_null() {
             return Ok(vec![]);
@@ -95,11 +89,7 @@ pub fn get_save_path(options: &SaveFileOptions) -> Result<Option<String>, String
                     JValue::Object(&j_name),
                 ],
             )
-            .and_then(|v| v.l())
-            .map_err(|e| {
-                env.exception_clear();
-                e.to_string()
-            })?;
+            .and_then(|v| v.l()).or_clear(env)?;
 
         if result.is_null() {
             return Ok(None);
@@ -123,10 +113,7 @@ pub fn get_directory_path(_initial_directory: Option<&str>) -> Result<Option<Str
                 &[JValue::Object(&activity)],
             )
             .and_then(|v| v.l())
-            .map_err(|e| {
-                env.exception_clear();
-                e.to_string()
-            })?;
+            .or_clear(env)?;
 
         if result.is_null() {
             return Ok(None);

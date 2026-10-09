@@ -108,14 +108,20 @@ fn java_vm_safe() -> Result<&'static JavaVM, String> {
     if ptr.is_null() {
         return Err("JavaVM not available".into());
     }
+    // SAFETY: `ptr` is the process's `JavaVM*`, from `android-activity` or from the
+    // host Activity's JNI env; it stays valid for the life of the process.
     Ok(JAVA_VM.get_or_init(|| unsafe { JavaVM::from_raw(ptr as *mut jni::sys::JavaVM) }))
 }
 
 /// Run a closure with an attached `jni::Env` for the current thread.
 ///
-/// In jni 0.22 the `attach_current_thread` API is closure-based.
-/// The thread is auto-detached when the closure returns (if it was
-/// not already attached).
+/// A thread that is not attached yet is attached for good (it detaches when it
+/// exits), so later calls on it are cheap. The closure runs in its own local
+/// reference frame.
+///
+/// A Java exception still pending when the closure returns is cleared and turned into
+/// the returned error, replacing the closure's own result. Clear exceptions where
+/// they happen when a failure is expected.
 pub fn with_env<T>(f: impl FnOnce(&mut jni::Env) -> Result<T, String>) -> Result<T, String> {
     let vm = java_vm_safe()?;
     let mut result: Option<Result<T, String>> = None;
@@ -127,41 +133,92 @@ pub fn with_env<T>(f: impl FnOnce(&mut jni::Env) -> Result<T, String>) -> Result
     result.unwrap()
 }
 
-/// Convenience alias: kept so existing callers that import `obtain_env`
-/// compile with minimal changes. Returns a result by running the given
-/// closure inside `with_env`.
+/// Same as [`with_env`].
+#[deprecated(note = "use `with_env`")]
 #[inline]
 pub fn obtain_env<T>(f: impl FnOnce(&mut jni::Env) -> Result<T, String>) -> Result<T, String> {
     with_env(f)
 }
 
-/// Get the Activity as a [`JObject`].
+/// The current Activity, as a local reference in `env`'s frame.
 ///
-/// `activity_as_ptr()` returns a JNI global reference from `android-activity`
-/// that is valid for the lifetime of the app. We wrap it in a `JObject`.
+/// On the host-driven path this is the most recently registered Activity that is
+/// neither finishing nor destroyed (see [`set_host_activity`]). The local reference
+/// stays valid for the rest of the frame even if that Activity is destroyed meanwhile.
 ///
-/// Requires `&Env` because jni 0.22's `JObject::from_raw` binds the
-/// local-reference-frame lifetime.
-pub fn activity<'local>(env: &jni::Env<'local>) -> Result<JObject<'local>, String> {
-    let ptr = activity_as_ptr();
-    if ptr.is_null() {
-        return Err("Activity not available".into());
+/// For calls that only need a `Context`, prefer [`application_context`].
+pub fn activity<'local>(env: &mut jni::Env<'local>) -> Result<JObject<'local>, String> {
+    if let Some(app) = ANDROID_APP.get() {
+        // SAFETY: `android-activity` keeps this global reference for the life of the
+        // process.
+        let global = unsafe { JObject::from_raw(env, app.activity_as_ptr() as jni::sys::jobject) };
+        return env.new_local_ref(&global).e();
     }
-    Ok(unsafe { JObject::from_raw(env, ptr as jni::sys::jobject) })
+    let mut activities = HOST_ACTIVITIES.lock().expect("poisoned");
+    // Only the newest is checked, so the common case costs two calls; older ones are
+    // pruned when the next Activity registers. Deleting a global reference is safe
+    // while the lock is held: only the deprecated `activity_as_ptr` hands out raw ones.
+    while let Some(newest) = activities.last() {
+        if !is_gone(env, newest) {
+            return env.new_local_ref(newest).e();
+        }
+        activities.pop();
+    }
+    Err("Activity not available".into())
+}
+
+/// The application context, as a local reference in `env`'s frame. Unlike an
+/// Activity it lives as long as the process, and its configuration follows
+/// system-wide changes.
+pub fn application_context<'local>(env: &mut jni::Env<'local>) -> Result<JObject<'local>, String> {
+    if ANDROID_APP.get().is_some() {
+        let activity = activity(env)?;
+        return env
+            .call_method(
+                &activity,
+                jni::jni_str!("getApplicationContext"),
+                jni::jni_sig!("()Landroid/content/Context;"),
+                &[],
+            )
+            .and_then(|value| value.l())
+            .or_clear(env);
+    }
+    let context = HOST_APPLICATION
+        .get()
+        .ok_or("set_host_activity has not been called")?;
+    env.new_local_ref(context).e()
 }
 
 /// Convert a Java String (`JObject` wrapping a `java.lang.String`) to a Rust `String`.
 ///
-/// Returns an empty string on null or error.
+/// Returns an empty string on null, on an object that is not a `String`, or on error.
 pub fn get_string(env: &mut jni::Env<'_>, obj: &JObject<'_>) -> String {
     if obj.is_null() {
         return String::new();
     }
+    match env.is_instance_of(obj, jni::jni_str!("java/lang/String")) {
+        Ok(true) => {}
+        Ok(false) => {
+            log::warn!("get_string: not a java.lang.String");
+            return String::new();
+        }
+        Err(err) => {
+            log::warn!(
+                "get_string: {}",
+                take_exception(env).unwrap_or(err.to_string())
+            );
+            return String::new();
+        }
+    }
+    // SAFETY: `obj` is a live, non-null reference to a `java.lang.String`.
     let jstr = unsafe { JString::from_raw(env, obj.as_raw()) };
     jstr.to_string()
 }
 
 /// Extension trait for converting `jni::errors::Result<T>` to `Result<T, String>`.
+///
+/// Leaves a Java exception pending; use [`JniResultExt::or_clear`] for calls into
+/// Java.
 pub(crate) trait JniExt<T> {
     fn e(self) -> Result<T, String>;
 }
@@ -172,38 +229,139 @@ impl<T> JniExt<T> for jni::errors::Result<T> {
     }
 }
 
-/// Find an application class by name using the Activity's classloader.
+/// Error handling for calls into Java.
+pub(crate) trait JniResultExt<T> {
+    /// On error, clear the pending Java exception, if any, and describe it: later
+    /// JNI calls in the same frame would otherwise fail too, and the bare JNI error
+    /// only says that an exception was thrown.
+    fn or_clear(self, env: &mut jni::Env<'_>) -> Result<T, String>;
+
+    /// Like [`or_clear`](Self::or_clear), but an exception that is an instance of
+    /// `class` (a JNI class name, e.g. `android/content/ActivityNotFoundException`)
+    /// is an expected outcome: it is cleared and the result is `Ok(None)`.
+    fn or_catch(
+        self,
+        env: &mut jni::Env<'_>,
+        class: &'static jni::strings::JNIStr,
+    ) -> Result<Option<T>, String>;
+}
+
+impl<T> JniResultExt<T> for jni::errors::Result<T> {
+    fn or_clear(self, env: &mut jni::Env<'_>) -> Result<T, String> {
+        self.map_err(|err| take_exception(env).unwrap_or_else(|| err.to_string()))
+    }
+
+    fn or_catch(
+        self,
+        env: &mut jni::Env<'_>,
+        class: &'static jni::strings::JNIStr,
+    ) -> Result<Option<T>, String> {
+        match self {
+            Ok(value) => Ok(Some(value)),
+            Err(err) => {
+                let Some(throwable) = env.exception_occurred() else {
+                    return Err(err.to_string());
+                };
+                env.exception_clear();
+                if env.is_instance_of(&throwable, class).unwrap_or(false) {
+                    return Ok(None);
+                }
+                env.throw(&throwable).ok();
+                Err(take_exception(env).unwrap_or_else(|| err.to_string()))
+            }
+        }
+    }
+}
+
+/// Clear the pending Java exception and return its `toString()`, if there is one.
+pub(crate) fn take_exception(env: &mut jni::Env<'_>) -> Option<String> {
+    let throwable = env.exception_occurred()?;
+    env.exception_clear();
+    let description = env
+        .call_method(
+            &throwable,
+            jni::jni_str!("toString"),
+            jni::jni_sig!("()Ljava/lang/String;"),
+            &[],
+        )
+        .and_then(|value| value.l());
+    match description {
+        Ok(description) => Some(get_string(env, &description)),
+        Err(_) => {
+            env.exception_clear();
+            Some("a Java exception was thrown".into())
+        }
+    }
+}
+
+/// Find an application class by name, through the app's class loader.
 ///
-/// From native threads, `JNIEnv::FindClass` uses the system classloader
-/// which doesn't know about application classes.  This helper uses the
-/// Activity's classloader via `activity.getClass().getClassLoader().loadClass(name)`.
+/// From native threads, `JNIEnv::FindClass` uses the system class loader, which
+/// doesn't know about application classes. This helper asks the application
+/// context's class loader instead. The loader and every class found are cached for
+/// the life of the process, so repeated lookups cost one JNI call.
 ///
 /// `class_name` uses Java dot notation (e.g. `"dev.gpui.mobile.GpuiHelper"`).
 pub fn find_app_class<'local>(
     env: &mut jni::Env<'local>,
     class_name: &str,
 ) -> Result<jni::objects::JClass<'local>, String> {
-    let act = activity(env)?;
+    let classes = APP_CLASSES.get_or_init(Default::default);
+    let cached = classes
+        .lock()
+        .expect("poisoned")
+        .get(class_name)
+        .map(|class| env.new_local_ref(class).e());
+    let class = match cached {
+        Some(class) => class?,
+        None => {
+            let class = load_app_class(env, class_name)?;
+            let global = env.new_global_ref(&class).e()?;
+            classes
+                .lock()
+                .expect("poisoned")
+                .insert(class_name.to_owned(), global);
+            class
+        }
+    };
+    // SAFETY: `class` is a local reference to a `java.lang.Class` in this frame.
+    Ok(unsafe { jni::objects::JClass::from_raw(env, class.into_raw()) })
+}
 
-    // activity.getClassLoader() — call on the Context instance directly.
-    // Do NOT use activity.getClass().getClassLoader(): NativeActivity is a
-    // framework class loaded by BootClassLoader, which cannot see app classes.
-    let class_loader = env
-        .call_method(
-            &act,
-            jni::jni_str!("getClassLoader"),
-            jni::jni_sig!("()Ljava/lang/ClassLoader;"),
-            &[],
-        )
-        .and_then(|v| v.l())
-        .map_err(|e| {
-            env.exception_clear();
-            let msg = format!("getClassLoader failed: {e}");
-            log::error!("find_app_class({class_name}): {msg}");
-            msg
-        })?;
+type ClassCache = Mutex<std::collections::HashMap<String, jni::refs::Global<JObject<'static>>>>;
 
-    // classLoader.loadClass("dev.gpui.mobile.GpuiHelper")
+/// Classes found by [`find_app_class`], by name.
+static APP_CLASSES: OnceLock<ClassCache> = OnceLock::new();
+
+/// The app's class loader, from the application context. A process has one.
+static APP_CLASS_LOADER: OnceLock<jni::refs::Global<JObject<'static>>> = OnceLock::new();
+
+fn load_app_class<'local>(
+    env: &mut jni::Env<'local>,
+    class_name: &str,
+) -> Result<JObject<'local>, String> {
+    let class_loader = match APP_CLASS_LOADER.get() {
+        Some(loader) => env.new_local_ref(loader).e()?,
+        None => {
+            // Not `getClass().getClassLoader()`: on the android-activity path the
+            // Activity is a NativeActivity, a framework class loaded by the boot class
+            // loader, which cannot see app classes.
+            let context = application_context(env)?;
+            let loader = env
+                .call_method(
+                    &context,
+                    jni::jni_str!("getClassLoader"),
+                    jni::jni_sig!("()Ljava/lang/ClassLoader;"),
+                    &[],
+                )
+                .and_then(|v| v.l())
+                .or_clear(env)
+                .map_err(|e| format!("getClassLoader failed: {e}"))?;
+            let _ = APP_CLASS_LOADER.set(env.new_global_ref(&loader).e()?);
+            loader
+        }
+    };
+
     let jname = env.new_string(class_name).e()?;
     let loaded = env
         .call_method(
@@ -213,17 +371,14 @@ pub fn find_app_class<'local>(
             &[JValue::Object(&jname)],
         )
         .and_then(|v| v.l())
+        .or_clear(env)
         .map_err(|e| {
-            // Print full Java stack trace to logcat, then clear.
-            env.exception_describe();
-            env.exception_clear();
             let msg = format!("loadClass({class_name}) failed: {e}");
             log::error!("{msg}");
             msg
         })?;
-
     log::debug!("find_app_class: loaded {class_name}");
-    Ok(unsafe { jni::objects::JClass::from_raw(env, loaded.as_raw()) })
+    Ok(loaded)
 }
 
 // ── global state ─────────────────────────────────────────────────────────────
@@ -244,34 +399,28 @@ static PLATFORM: OnceLock<Arc<AndroidPlatform>> = OnceLock::new();
 /// `getUnicodeChar(metaState)` on it.  Returns 0 on failure.
 pub fn unicode_char_for_key_event(key_code: i32, action: i32, meta_state: i32) -> u32 {
     with_env(|env| {
-        let key_event = match env.new_object(
-            jni::jni_str!("android/view/KeyEvent"),
-            jni::jni_sig!("(II)V"),
-            &[JValue::Int(action), JValue::Int(key_code)],
-        ) {
-            Ok(o) => o,
-            Err(_) => {
-                env.exception_clear();
-                return Ok(0);
-            }
-        };
-        match env.call_method(
-            &key_event,
-            jni::jni_str!("getUnicodeChar"),
-            jni::jni_sig!("(I)I"),
-            &[JValue::Int(meta_state)],
-        ) {
-            Ok(v) => {
-                let c = v.i().unwrap_or(0);
-                Ok(if c > 0 { c as u32 } else { 0 })
-            }
-            Err(_) => {
-                env.exception_clear();
-                Ok(0)
-            }
-        }
+        let key_event = env
+            .new_object(
+                jni::jni_str!("android/view/KeyEvent"),
+                jni::jni_sig!("(II)V"),
+                &[JValue::Int(action), JValue::Int(key_code)],
+            )
+            .or_clear(env)?;
+        let c = env
+            .call_method(
+                &key_event,
+                jni::jni_str!("getUnicodeChar"),
+                jni::jni_sig!("(I)I"),
+                &[JValue::Int(meta_state)],
+            )
+            .and_then(|v| v.i())
+            .or_clear(env)?;
+        Ok(c.max(0) as u32)
     })
-    .unwrap_or(0)
+    .unwrap_or_else(|err| {
+        log::warn!("unicode_char_for_key_event: {err}");
+        0
+    })
 }
 
 // ── public accessors ──────────────────────────────────────────────────────────
@@ -280,32 +429,41 @@ pub fn unicode_char_for_key_event(key_code: i32, action: i32, meta_state: i32) -
 /// `AndroidApp` to read it from.
 static HOST_VM: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 
-/// Current Activity for the host-driven entry point, as a JNI global reference we
-/// own. Replaced on every Activity creation so [`activity_as_ptr`] always names the
-/// *live* Activity.
-///
-/// The outgoing reference is kept one generation longer: `activity_as_ptr` hands out a
-/// raw `jobject`, and a call on the render thread may still be using the previous
-/// Activity while the UI thread installs the next one.
-static HOST_ACTIVITY: Mutex<HostActivity> = Mutex::new(HostActivity {
-    current: None,
-    previous: None,
-});
+/// Activities registered by the host-driven entry point, oldest first, as JNI
+/// global references we own. [`activity`] answers with the newest one that is
+/// neither finishing nor destroyed, and drops the references of those that are, so a
+/// finished Activity is neither used nor kept alive.
+static HOST_ACTIVITIES: Mutex<Vec<jni::refs::Global<JObject<'static>>>> = Mutex::new(Vec::new());
 
-struct HostActivity {
-    current: Option<jni::refs::Global<JObject<'static>>>,
-    previous: Option<jni::refs::Global<JObject<'static>>>,
+/// Drop the Activities that are finishing or destroyed.
+fn prune_gone_activities(
+    env: &mut jni::Env<'_>,
+    activities: &mut Vec<jni::refs::Global<JObject<'static>>>,
+) {
+    activities.retain(|activity| !is_gone(env, activity));
+}
+
+fn is_gone(env: &mut jni::Env<'_>, activity: &JObject<'_>) -> bool {
+    let mut ask = |name| {
+        env.call_method(activity, name, jni::jni_sig!("()Z"), &[])
+            .and_then(|value| value.z())
+            .or_clear(env)
+            .unwrap_or(false)
+    };
+    ask(jni::jni_str!("isFinishing")) || ask(jni::jni_str!("isDestroyed"))
 }
 
 /// Register the current Activity when running without `android-activity`.
 ///
 /// Call from a JNI entry point in `Activity.onCreate`, every time — a recreated
 /// Activity is a new object. This module takes its own global reference and records
-/// the JVM, so `java_vm()` / `activity_as_ptr()` and everything built on them (IME,
-/// safe areas, file pickers, `rustls-platform-verifier`) work exactly as on the
-/// `android-activity` path. A no-op when `android-activity` owns the process.
-/// Call it before `host::start`: the platform reads bundled assets (the emoji font)
-/// when it starts.
+/// the JVM, so [`activity`], `java_vm()` and everything built on them (IME, safe
+/// areas, file pickers, `rustls-platform-verifier`) work exactly as on the
+/// `android-activity` path. Each Activity is used until it finishes or is destroyed;
+/// with several alive, the most recently registered one is used. A no-op when
+/// `android-activity` owns the process.
+/// Call it on the UI thread (as `onCreate` is), and before `host::start`: the
+/// platform reads bundled assets (the emoji font) when it starts.
 pub fn set_host_activity(env: &mut jni::Env<'_>, activity: &JObject<'_>) -> Result<(), String> {
     if ANDROID_APP.get().is_some() {
         return Ok(());
@@ -316,22 +474,24 @@ pub fn set_host_activity(env: &mut jni::Env<'_>, activity: &JObject<'_>) -> Resu
         vm.get_raw() as *mut c_void,
         std::sync::atomic::Ordering::SeqCst,
     );
-    let mut slot = HOST_ACTIVITY.lock().expect("poisoned");
-    slot.previous = slot.current.take();
-    slot.current = Some(global);
-    drop(slot);
+    let mut activities = HOST_ACTIVITIES.lock().expect("poisoned");
+    prune_gone_activities(env, &mut activities);
+    activities.push(global);
+    drop(activities);
+    // A new Activity has a new Window: apply the system chrome to it again.
+    *LAST_CHROME_STYLE.lock().expect("poisoned") = None;
+    if UI_THREAD.get().is_none() {
+        if let Err(err) = register_ui_thread() {
+            log::warn!("set_host_activity: cannot post to the UI thread: {err}");
+        }
+    }
     super::accessibility::activity_changed();
     if HOST_APPLICATION.get().is_none() {
-        match application_context(env, activity) {
+        match fetch_application_context(env, activity) {
             Ok(context) => {
                 let _ = HOST_APPLICATION.set(context);
             }
-            Err(err) => {
-                if env.exception_check() {
-                    env.exception_clear();
-                }
-                log::warn!("set_host_activity: no application context: {err}");
-            }
+            Err(err) => log::warn!("set_host_activity: no application context: {err}"),
         }
     }
     if HOST_ASSETS.get().is_none() {
@@ -339,12 +499,7 @@ pub fn set_host_activity(env: &mut jni::Env<'_>, activity: &JObject<'_>) -> Resu
             Ok(assets) => {
                 let _ = HOST_ASSETS.set(assets);
             }
-            Err(err) => {
-                if env.exception_check() {
-                    env.exception_clear();
-                }
-                log::warn!("set_host_activity: no AssetManager: {err}");
-            }
+            Err(err) => log::warn!("set_host_activity: no AssetManager: {err}"),
         }
     }
     Ok(())
@@ -355,7 +510,7 @@ pub fn set_host_activity(env: &mut jni::Env<'_>, activity: &JObject<'_>) -> Resu
 /// mode, whichever Activity is in front and whatever it handles itself.
 static HOST_APPLICATION: OnceLock<jni::refs::Global<JObject<'static>>> = OnceLock::new();
 
-fn application_context(
+fn fetch_application_context(
     env: &mut jni::Env<'_>,
     activity: &JObject<'_>,
 ) -> Result<jni::refs::Global<JObject<'static>>, String> {
@@ -367,7 +522,7 @@ fn application_context(
             &[],
         )
         .and_then(|value| value.l())
-        .e()?;
+        .or_clear(env)?;
     if context.is_null() {
         return Err("getApplicationContext returned null".into());
     }
@@ -394,7 +549,7 @@ fn host_assets(env: &mut jni::Env<'_>, activity: &JObject<'_>) -> Result<HostAss
             &[],
         )
         .and_then(|value| value.l())
-        .e()?;
+        .or_clear(env)?;
     let assets = env
         .call_method(
             &context,
@@ -403,7 +558,7 @@ fn host_assets(env: &mut jni::Env<'_>, activity: &JObject<'_>) -> Result<HostAss
             &[],
         )
         .and_then(|value| value.l())
-        .e()?;
+        .or_clear(env)?;
     if assets.is_null() {
         return Err("getAssets returned null".into());
     }
@@ -440,25 +595,22 @@ pub fn java_vm() -> *mut c_void {
         .unwrap_or_else(|| HOST_VM.load(std::sync::atomic::Ordering::SeqCst))
 }
 
-/// Public accessor for the current Activity's JNI object reference.
+/// The current Activity as a raw JNI global reference (a `jobject`, not an
+/// `ANativeActivity *`), or null.
 ///
-/// Uses `AndroidApp::activity_as_ptr()` from the stored `AndroidApp`.
-/// Used by `platform.rs` and `window.rs` for JNI calls that require the
-/// activity's jobject.
-///
-/// NOTE: This returns a jobject (JNI global ref), NOT an `ANativeActivity *`.
-/// Code that previously used `(*activity).clazz` should use this directly
-/// as the activity jobject.
+/// On the host-driven path the reference is deleted once its Activity finishes and a
+/// later [`activity`] or [`set_host_activity`] call notices, so it must not be kept.
+/// Prefer [`activity`], which returns a local reference.
+#[deprecated(note = "the reference may be deleted while in use; use `activity(env)`")]
 pub fn activity_as_ptr() -> *mut c_void {
     ANDROID_APP
         .get()
         .map(|app| app.activity_as_ptr())
         .unwrap_or_else(|| {
-            HOST_ACTIVITY
+            HOST_ACTIVITIES
                 .lock()
                 .expect("poisoned")
-                .current
-                .as_ref()
+                .last()
                 .map(|activity| activity.as_raw() as *mut c_void)
                 .unwrap_or(std::ptr::null_mut())
         })
@@ -510,6 +662,126 @@ const AMOTION_EVENT_ACTION_UP: u32 = 1;
 const AMOTION_EVENT_ACTION_MOVE: u32 = 2;
 const AMOTION_EVENT_ACTION_CANCEL: u32 = 3;
 
+// ── UI thread ────────────────────────────────────────────────────────────────
+
+/// The Java UI thread's looper, with an eventfd that wakes it to run
+/// [`run_on_ui_thread`] tasks.
+struct UiThread {
+    id: std::thread::ThreadId,
+    wake: std::os::fd::OwnedFd,
+    _looper: ndk::looper::ForeignLooper,
+}
+
+static UI_THREAD: OnceLock<UiThread> = OnceLock::new();
+
+type UiTask = Box<dyn FnOnce(&mut jni::Env<'_>) + Send>;
+
+/// Pending tasks, with the key of those posted by [`run_latest_on_ui_thread`].
+static UI_TASKS: Mutex<Vec<(Option<&'static str>, UiTask)>> = Mutex::new(Vec::new());
+
+/// Remember the calling thread, which must be the UI thread, as the one
+/// [`run_on_ui_thread`] posts to.
+fn register_ui_thread() -> Result<(), String> {
+    use std::os::fd::{AsFd, FromRawFd};
+
+    let looper = ndk::looper::ForeignLooper::for_thread().ok_or("this thread has no looper")?;
+    // SAFETY: plain syscall; the descriptor is owned by `wake` from here on.
+    let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+    if fd < 0 {
+        return Err(format!("eventfd: {}", std::io::Error::last_os_error()));
+    }
+    // SAFETY: `fd` is a new descriptor nothing else owns.
+    let wake = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+    looper
+        .add_fd_with_callback(wake.as_fd(), ndk::looper::FdEvent::INPUT, |fd, _| {
+            let mut count = [0u8; 8];
+            // SAFETY: reads 8 bytes into `count`; resets the eventfd counter.
+            unsafe {
+                libc::read(
+                    std::os::fd::AsRawFd::as_raw_fd(&fd),
+                    count.as_mut_ptr().cast(),
+                    8,
+                )
+            };
+            run_ui_tasks();
+            true
+        })
+        .map_err(|err| format!("ALooper_addFd: {err:?}"))?;
+    let _ = UI_THREAD.set(UiThread {
+        id: std::thread::current().id(),
+        wake,
+        _looper: looper,
+    });
+    Ok(())
+}
+
+fn run_ui_tasks() {
+    let tasks = std::mem::take(&mut *UI_TASKS.lock().expect("poisoned"));
+    for (_, task) in tasks {
+        run_ui_task(task);
+    }
+}
+
+/// Run a task in its own frame, so an exception it leaves cannot fail the next.
+fn run_ui_task(task: UiTask) {
+    if let Err(err) = with_env(|env| {
+        task(env);
+        Ok(())
+    }) {
+        log::warn!("run_on_ui_thread: {err}");
+    }
+}
+
+/// Run `f` on the Java UI thread, which Android requires for `View` and `Window`
+/// calls: soon if called from another thread, right away on the UI thread itself.
+///
+/// On the host-driven path the UI thread is the one that called
+/// [`set_host_activity`]. On the `android-activity` path it cannot be reached without
+/// Java code, so `f` runs on the calling thread, as these calls always did there.
+pub fn run_on_ui_thread(f: impl FnOnce(&mut jni::Env<'_>) + Send + 'static) {
+    post_to_ui_thread(None, Box::new(f));
+}
+
+/// Like [`run_on_ui_thread`], but a task posted with the same `key` that has not run
+/// yet is dropped: for updates where only the latest matters (the IME cursor
+/// position, the system chrome), so they cannot pile up behind a busy UI thread.
+pub(crate) fn run_latest_on_ui_thread(
+    key: &'static str,
+    f: impl FnOnce(&mut jni::Env<'_>) + Send + 'static,
+) {
+    post_to_ui_thread(Some(key), Box::new(f));
+}
+
+fn post_to_ui_thread(key: Option<&'static str>, task: UiTask) {
+    let Some(ui) = UI_THREAD.get() else {
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            log::debug!("run_on_ui_thread: no UI thread registered; running in place");
+        }
+        run_ui_task(task);
+        return;
+    };
+    if std::thread::current().id() == ui.id {
+        run_ui_task(task);
+        return;
+    }
+    let mut tasks = UI_TASKS.lock().expect("poisoned");
+    if key.is_some() {
+        tasks.retain(|(pending, _)| *pending != key);
+    }
+    tasks.push((key, task));
+    drop(tasks);
+    let one = 1u64.to_ne_bytes();
+    // SAFETY: writes 8 bytes from `one` to the eventfd, which wakes the UI looper.
+    unsafe {
+        libc::write(
+            std::os::fd::AsRawFd::as_raw_fd(&ui.wake),
+            one.as_ptr().cast(),
+            8,
+        )
+    };
+}
+
 // ── night mode query ─────────────────────────────────────────────────────────
 
 /// Query the current night mode.
@@ -541,30 +813,27 @@ fn host_ui_mode() -> Result<i32, String> {
         .get()
         .ok_or("set_host_activity has not been called")?;
     with_env(|env| {
-        let result = (|| {
-            let resources = env
-                .call_method(
-                    context,
-                    jni::jni_str!("getResources"),
-                    jni::jni_sig!("()Landroid/content/res/Resources;"),
-                    &[],
-                )?
-                .l()?;
-            let config = env
-                .call_method(
-                    &resources,
-                    jni::jni_str!("getConfiguration"),
-                    jni::jni_sig!("()Landroid/content/res/Configuration;"),
-                    &[],
-                )?
-                .l()?;
-            env.get_field(&config, jni::jni_str!("uiMode"), jni::jni_sig!("I"))?
-                .i()
-        })();
-        if result.is_err() {
-            env.exception_clear();
-        }
-        result.e()
+        let resources = env
+            .call_method(
+                context,
+                jni::jni_str!("getResources"),
+                jni::jni_sig!("()Landroid/content/res/Resources;"),
+                &[],
+            )
+            .and_then(|v| v.l())
+            .or_clear(env)?;
+        let config = env
+            .call_method(
+                &resources,
+                jni::jni_str!("getConfiguration"),
+                jni::jni_sig!("()Landroid/content/res/Configuration;"),
+                &[],
+            )
+            .and_then(|v| v.l())
+            .or_clear(env)?;
+        env.get_field(&config, jni::jni_str!("uiMode"), jni::jni_sig!("I"))
+            .and_then(|v| v.i())
+            .or_clear(env)
     })
 }
 
@@ -1054,13 +1323,15 @@ pub fn run_event_loop(app: &AndroidApp) {
 fn pause_platform_views() {
     let _ = with_env(|env| {
         if let Ok(helper_class) = find_app_class(env, "dev.gpui.mobile.GpuiPlatformView") {
-            let _ = env.call_static_method(
+            let result = env.call_static_method(
                 &helper_class,
                 jni::jni_str!("pauseAll"),
                 jni::jni_sig!("()V"),
                 &[],
             );
-            env.exception_clear();
+            if let Err(err) = result.or_clear(env) {
+                log::warn!("pauseAll: {err}");
+            }
         }
         Ok(())
     });
@@ -1070,13 +1341,15 @@ fn pause_platform_views() {
 fn resume_platform_views() {
     let _ = with_env(|env| {
         if let Ok(helper_class) = find_app_class(env, "dev.gpui.mobile.GpuiPlatformView") {
-            let _ = env.call_static_method(
+            let result = env.call_static_method(
                 &helper_class,
                 jni::jni_str!("resumeAll"),
                 jni::jni_sig!("()V"),
                 &[],
             );
-            env.exception_clear();
+            if let Err(err) = result.or_clear(env) {
+                log::warn!("resumeAll: {err}");
+            }
         }
         Ok(())
     });
@@ -1086,13 +1359,15 @@ fn resume_platform_views() {
 fn dispose_all_platform_views() {
     let _ = with_env(|env| {
         if let Ok(helper_class) = find_app_class(env, "dev.gpui.mobile.GpuiPlatformView") {
-            let _ = env.call_static_method(
+            let result = env.call_static_method(
                 &helper_class,
                 jni::jni_str!("disposeAll"),
                 jni::jni_sig!("()V"),
                 &[],
             );
-            env.exception_clear();
+            if let Err(err) = result.or_clear(env) {
+                log::warn!("disposeAll: {err}");
+            }
         }
         Ok(())
     });
@@ -1291,11 +1566,9 @@ pub fn init_platform(app: &AndroidApp) -> &'static Arc<AndroidPlatform> {
 
 /// Cached last-applied system chrome style.
 ///
-/// `set_system_chrome` is called on every frame render.  The JNI calls it
-/// makes (getWindow, setStatusBarColor, etc.) are View operations that can
-/// contend with the Android UI thread and intermittently deadlock.
-/// By caching the last applied style we skip the JNI calls entirely when
-/// nothing changed — which is the common case.
+/// `set_system_chrome` is called on every frame render. By caching the last
+/// applied style we skip the JNI calls entirely when nothing changed — which is the
+/// common case.
 #[allow(clippy::type_complexity)]
 static LAST_CHROME_STYLE: std::sync::Mutex<
     Option<(Option<u32>, Option<u32>, crate::StatusBarContentStyle)>,
@@ -1304,15 +1577,14 @@ static LAST_CHROME_STYLE: std::sync::Mutex<
 /// Apply system chrome styling on Android.
 ///
 /// Sets the status bar color, navigation bar color, and light/dark
-/// status bar icons via JNI calls to `Window` and `WindowInsetsController`.
-///
-/// Must be called from the main (native) thread that has JNI access.
+/// status bar icons via JNI calls to `Window` and `WindowInsetsController`, which run
+/// on the UI thread (see [`run_on_ui_thread`]).
 pub fn set_system_chrome(style: &crate::SystemChromeStyle) {
     let status_bar_color = style.status_bar_color;
     let navigation_bar_color = style.navigation_bar_color;
     let status_bar_style = style.status_bar_style;
 
-    // Skip the (expensive, potentially deadlocking) JNI calls when nothing changed.
+    // Skip the JNI calls when nothing changed.
     {
         let key = (status_bar_color, navigation_bar_color, status_bar_style);
         let mut last = LAST_CHROME_STYLE.lock().unwrap();
@@ -1322,119 +1594,128 @@ pub fn set_system_chrome(style: &crate::SystemChromeStyle) {
         *last = Some(key);
     }
 
-    let result = with_env(|env| {
-        let activity_obj = activity(env)?;
+    // Window calls belong on the UI thread; from the render thread they could
+    // deadlock against it.
+    run_latest_on_ui_thread("system_chrome", move |env| {
+        let result = (|| -> Result<(), String> {
+            let activity_obj = activity(env)?;
 
-        // 1. Get the Window: activity.getWindow()
-        let window = env
-            .call_method(
-                &activity_obj,
-                jni::jni_str!("getWindow"),
-                jni::jni_sig!("()Landroid/view/Window;"),
-                &[],
-            )
-            .and_then(|v: jni::objects::JValueOwned| v.l())
-            .map_err(|e| {
-                env.exception_clear();
-                e.to_string()
-            })?;
-        if window.is_null() {
-            return Err("getWindow returned null".into());
-        }
-
-        // 2. Set status bar color if provided
-        if let Some(color) = status_bar_color {
-            let argb = (0xFF000000_u32 | color) as i32;
-            let _ = env.call_method(
-                &window,
-                jni::jni_str!("setStatusBarColor"),
-                jni::jni_sig!("(I)V"),
-                &[JValue::Int(argb)],
-            );
-            env.exception_clear();
-        }
-
-        // 3. Set navigation bar color if provided
-        if let Some(color) = navigation_bar_color {
-            let argb = (0xFF000000_u32 | color) as i32;
-            let _ = env.call_method(
-                &window,
-                jni::jni_str!("setNavigationBarColor"),
-                jni::jni_sig!("(I)V"),
-                &[JValue::Int(argb)],
-            );
-            env.exception_clear();
-        }
-
-        // 4. Set light/dark status bar icons via WindowInsetsController (API 30+)
-        let insetsctl = env.call_method(
-            &window,
-            jni::jni_str!("getInsetsController"),
-            jni::jni_sig!("()Landroid/view/WindowInsetsController;"),
-            &[],
-        );
-
-        if let Ok(v) = insetsctl {
-            if let Ok(ctl) = v.l() {
-                if !ctl.is_null() {
-                    let mask: i32 = 0x00000008;
-                    let appearance: i32 = match status_bar_style {
-                        crate::StatusBarContentStyle::Dark => 0x00000008,
-                        crate::StatusBarContentStyle::Light => 0,
-                    };
-                    let _ = env.call_method(
-                        &ctl,
-                        jni::jni_str!("setSystemBarsAppearance"),
-                        jni::jni_sig!("(II)V"),
-                        &[JValue::Int(appearance), JValue::Int(mask)],
-                    );
-                    env.exception_clear();
-                }
-            }
-        } else {
-            env.exception_clear();
-
-            if let Ok(decor) = env
+            // 1. Get the Window: activity.getWindow()
+            let window = env
                 .call_method(
-                    &window,
-                    jni::jni_str!("getDecorView"),
-                    jni::jni_sig!("()Landroid/view/View;"),
+                    &activity_obj,
+                    jni::jni_str!("getWindow"),
+                    jni::jni_sig!("()Landroid/view/Window;"),
                     &[],
                 )
                 .and_then(|v: jni::objects::JValueOwned| v.l())
-            {
-                if !decor.is_null() {
-                    if let Ok(current) = env
+                .or_clear(env)?;
+            if window.is_null() {
+                return Err("getWindow returned null".into());
+            }
+
+            // 2. Set status bar color if provided
+            if let Some(color) = status_bar_color {
+                let argb = (0xFF000000_u32 | color) as i32;
+                let result = env.call_method(
+                    &window,
+                    jni::jni_str!("setStatusBarColor"),
+                    jni::jni_sig!("(I)V"),
+                    &[JValue::Int(argb)],
+                );
+                if let Err(err) = result.or_clear(env) {
+                    log::warn!("setStatusBarColor: {err}");
+                }
+            }
+
+            // 3. Set navigation bar color if provided
+            if let Some(color) = navigation_bar_color {
+                let argb = (0xFF000000_u32 | color) as i32;
+                let result = env.call_method(
+                    &window,
+                    jni::jni_str!("setNavigationBarColor"),
+                    jni::jni_sig!("(I)V"),
+                    &[JValue::Int(argb)],
+                );
+                if let Err(err) = result.or_clear(env) {
+                    log::warn!("setNavigationBarColor: {err}");
+                }
+            }
+
+            // 4. Set light/dark status bar icons via WindowInsetsController (API 30+),
+            //    or the deprecated system UI visibility flags before it.
+            let controller = env
+                .call_method(
+                    &window,
+                    jni::jni_str!("getInsetsController"),
+                    jni::jni_sig!("()Landroid/view/WindowInsetsController;"),
+                    &[],
+                )
+                .and_then(|v| v.l())
+                .or_catch(env, jni::jni_str!("java/lang/NoSuchMethodError"))?;
+            match controller {
+                Some(controller) if !controller.is_null() => {
+                    const APPEARANCE_LIGHT_STATUS_BARS: i32 = 0x0000_0008;
+                    let appearance = match status_bar_style {
+                        crate::StatusBarContentStyle::Dark => APPEARANCE_LIGHT_STATUS_BARS,
+                        crate::StatusBarContentStyle::Light => 0,
+                    };
+                    env.call_method(
+                        &controller,
+                        jni::jni_str!("setSystemBarsAppearance"),
+                        jni::jni_sig!("(II)V"),
+                        &[
+                            JValue::Int(appearance),
+                            JValue::Int(APPEARANCE_LIGHT_STATUS_BARS),
+                        ],
+                    )
+                    .or_clear(env)?;
+                }
+                Some(_) => {}
+                None => {
+                    const SYSTEM_UI_FLAG_LIGHT_STATUS_BAR: i32 = 0x0000_2000;
+                    let decor = env
+                        .call_method(
+                            &window,
+                            jni::jni_str!("getDecorView"),
+                            jni::jni_sig!("()Landroid/view/View;"),
+                            &[],
+                        )
+                        .and_then(|v| v.l())
+                        .or_clear(env)?;
+                    let current = env
                         .call_method(
                             &decor,
                             jni::jni_str!("getSystemUiVisibility"),
                             jni::jni_sig!("()I"),
                             &[],
                         )
-                        .and_then(|v: jni::objects::JValueOwned| v.i())
-                    {
-                        let new_flags = match status_bar_style {
-                            crate::StatusBarContentStyle::Dark => current | 0x00002000,
-                            crate::StatusBarContentStyle::Light => current & !0x00002000,
-                        };
-                        let _ = env.call_method(
-                            &decor,
-                            jni::jni_str!("setSystemUiVisibility"),
-                            jni::jni_sig!("(I)V"),
-                            &[JValue::Int(new_flags)],
-                        );
-                        env.exception_clear();
-                    }
+                        .and_then(|v| v.i())
+                        .or_clear(env)?;
+                    let flags = match status_bar_style {
+                        crate::StatusBarContentStyle::Dark => {
+                            current | SYSTEM_UI_FLAG_LIGHT_STATUS_BAR
+                        }
+                        crate::StatusBarContentStyle::Light => {
+                            current & !SYSTEM_UI_FLAG_LIGHT_STATUS_BAR
+                        }
+                    };
+                    env.call_method(
+                        &decor,
+                        jni::jni_str!("setSystemUiVisibility"),
+                        jni::jni_sig!("(I)V"),
+                        &[JValue::Int(flags)],
+                    )
+                    .or_clear(env)?;
                 }
             }
+
+            Ok(())
+        })();
+        if let Err(e) = result {
+            log::warn!("set_system_chrome: {e}");
         }
-
-        Ok(())
     });
-
-    if let Err(e) = result {
-        log::warn!("set_system_chrome: {e}");
-    }
 
     log::info!(
         "set_system_chrome: status_bar_color={:?}, nav_bar_color={:?}, style={:?}",
@@ -1526,14 +1807,10 @@ pub fn show_keyboard_android(keyboard_type: crate::KeyboardType) {
             jni::jni_sig!("(IJ)V"),
             &[JValue::Int(kind), JValue::Long(session as i64)],
         )
-        .map_err(|e| e.to_string())?;
+        .or_clear(env)?;
         Ok(())
     }) {
         log::warn!("IME requires GpuiInputActivity: {error}");
-        let _ = with_env(|env| {
-            env.exception_clear();
-            Ok(())
-        });
     }
 }
 
@@ -1544,18 +1821,19 @@ pub fn hide_keyboard_android() {
     *SHOWN_KEYBOARD.lock().expect("poisoned") = None;
     *DISMISSED_KEYBOARD.lock().expect("poisoned") = None;
     let session = super::text_input::new_session();
-    let _ = with_env(|env| {
+    if let Err(err) = with_env(|env| {
         let activity = activity(env)?;
-        let result = env.call_method(
+        env.call_method(
             &activity,
             jni::jni_str!("gpuiHideKeyboard"),
             jni::jni_sig!("(J)V"),
             &[JValue::Long(session as i64)],
-        );
-        env.exception_clear();
-        result.map_err(|e| e.to_string())?;
+        )
+        .or_clear(env)?;
         Ok(())
-    });
+    }) {
+        log::debug!("gpuiHideKeyboard: {err}");
+    }
     if let Some(app) = android_app() {
         app.hide_soft_input(false);
     }
@@ -1563,18 +1841,19 @@ pub fn hide_keyboard_android() {
 
 pub(super) fn reset_keyboard_composition() {
     let session = super::text_input::new_session();
-    let _ = with_env(|env| {
+    if let Err(err) = with_env(|env| {
         let activity = activity(env)?;
-        let result = env.call_method(
+        env.call_method(
             &activity,
             jni::jni_str!("gpuiResetComposition"),
             jni::jni_sig!("(J)V"),
             &[JValue::Long(session as i64)],
-        );
-        env.exception_clear();
-        result.map_err(|e| e.to_string())?;
+        )
+        .or_clear(env)?;
         Ok(())
-    });
+    }) {
+        log::debug!("gpuiResetComposition: {err}");
+    }
 }
 
 /// Receive Java InputConnection updates without touching GPUI on the UI thread.
@@ -1591,7 +1870,9 @@ pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiInputActivity_nativeIme(
     start: i32,
     end: i32,
 ) {
-    let _ = with_env(|env| {
+    if let Err(err) = with_env(|env| {
+        // SAFETY: `text` is a local reference JNI passed to this call, valid until it
+        // returns.
         let text = unsafe { JObject::from_raw(env, text as jni::sys::jobject) };
         super::text_input::enqueue(super::text_input::ImeEvent {
             session: session as u64,
@@ -1601,7 +1882,9 @@ pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiInputActivity_nativeIme(
             end: end.max(0) as usize,
         });
         Ok(())
-    });
+    }) {
+        log::warn!("nativeIme: {err}");
+    }
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -1645,10 +1928,11 @@ pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiActivity_nativeOnDeepLink(
     // We already have a JVM attached on this thread (UI thread).
     // Use with_env to get a properly wrapped Env handle.
     let url_raw = url as jni::sys::jobject;
-    let _ = with_env(|env| {
+    if let Err(err) = with_env(|env| {
+        // SAFETY: `url` is a local reference JNI passed to this call, valid until it
+        // returns.
         let url_obj = unsafe { JObject::from_raw(env, url_raw) };
         let url_string = get_string(env, &url_obj);
-        // Don't let the JObject be dropped (it's owned by the JNI call frame).
         if url_string.is_empty() {
             return Ok(());
         }
@@ -1659,7 +1943,9 @@ pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiActivity_nativeOnDeepLink(
             crate::packages::deeplink::notify_deep_link(&url_string);
         }
         Ok(())
-    });
+    }) {
+        log::warn!("nativeOnDeepLink: {err}");
+    }
 }
 
 /// JNI bridge: receive a media action from `GpuiMediaSession` system controls.
@@ -1676,7 +1962,9 @@ pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiMediaSession_nativeMediaAction
     action: *mut std::ffi::c_void,
 ) {
     let action_raw = action as jni::sys::jobject;
-    let _ = with_env(|env| {
+    if let Err(err) = with_env(|env| {
+        // SAFETY: `action` is a local reference JNI passed to this call, valid until
+        // it returns.
         let action_obj = unsafe { JObject::from_raw(env, action_raw) };
         let action_str = get_string(env, &action_obj);
 
@@ -1695,7 +1983,9 @@ pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiMediaSession_nativeMediaAction
         log::info!("nativeMediaAction: {:?}", media_action);
         crate::packages::media_session::notify_action(media_action);
         Ok(())
-    });
+    }) {
+        log::warn!("nativeMediaAction: {err}");
+    }
 }
 
 /// JNI bridge: receive a seek request from `GpuiMediaSession` system controls.
@@ -1733,6 +2023,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn activity_as_ptr_returns_null_before_init() {
         let ptr = activity_as_ptr();
         assert!(ptr.is_null());

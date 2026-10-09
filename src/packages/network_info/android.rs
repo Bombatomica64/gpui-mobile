@@ -1,32 +1,29 @@
 use super::NetworkInfo;
-use crate::android::jni::{self as jni_helpers, get_string};
+use crate::android::jni::{self as jni_helpers, get_string, JniExt, JniResultExt as _};
 use jni::objects::JValue;
 
 pub fn get_network_info() -> Result<NetworkInfo, String> {
     jni_helpers::with_env(|env| {
-        let activity = jni_helpers::activity(env)?;
+        let context = jni_helpers::application_context(env)?;
         let mut info = NetworkInfo::default();
 
         // context.getSystemService("wifi") → WifiManager
-        let service_name = env.new_string("wifi").map_err(|e| e.to_string())?;
-        let wifi_mgr = match env
+        let service_name = env.new_string("wifi").e()?;
+        let wifi_mgr = env
             .call_method(
-                &activity,
+                &context,
                 jni::jni_str!("getSystemService"),
                 jni::jni_sig!("(Ljava/lang/String;)Ljava/lang/Object;"),
                 &[JValue::Object(&service_name)],
             )
             .and_then(|v| v.l())
-        {
-            Ok(o) if !o.is_null() => o,
-            _ => {
-                env.exception_clear();
-                return Ok(info);
-            }
-        };
+            .or_clear(env)?;
+        if wifi_mgr.is_null() {
+            return Ok(info);
+        }
 
         // wifiManager.getConnectionInfo() → WifiInfo
-        let wifi_info = match env
+        let wifi_info = env
             .call_method(
                 &wifi_mgr,
                 jni::jni_str!("getConnectionInfo"),
@@ -34,16 +31,13 @@ pub fn get_network_info() -> Result<NetworkInfo, String> {
                 &[],
             )
             .and_then(|v| v.l())
-        {
-            Ok(o) if !o.is_null() => o,
-            _ => {
-                env.exception_clear();
-                return Ok(info);
-            }
-        };
+            .or_clear(env)?;
+        if wifi_info.is_null() {
+            return Ok(info);
+        }
 
         // SSID
-        if let Ok(ssid_obj) = env
+        let ssid_obj = env
             .call_method(
                 &wifi_info,
                 jni::jni_str!("getSSID"),
@@ -51,6 +45,7 @@ pub fn get_network_info() -> Result<NetworkInfo, String> {
                 &[],
             )
             .and_then(|v| v.l())
+            .or_clear(env)?;
         {
             let ssid = get_string(env, &ssid_obj);
             let ssid = ssid.trim_matches('"').to_string();
@@ -60,7 +55,7 @@ pub fn get_network_info() -> Result<NetworkInfo, String> {
         }
 
         // BSSID
-        if let Ok(bssid_obj) = env
+        let bssid_obj = env
             .call_method(
                 &wifi_info,
                 jni::jni_str!("getBSSID"),
@@ -68,6 +63,7 @@ pub fn get_network_info() -> Result<NetworkInfo, String> {
                 &[],
             )
             .and_then(|v| v.l())
+            .or_clear(env)?;
         {
             let bssid = get_string(env, &bssid_obj);
             if !bssid.is_empty() && bssid != "02:00:00:00:00:00" {
@@ -76,7 +72,7 @@ pub fn get_network_info() -> Result<NetworkInfo, String> {
         }
 
         // IP Address
-        if let Ok(ip) = env
+        let ip = env
             .call_method(
                 &wifi_info,
                 jni::jni_str!("getIpAddress"),
@@ -84,6 +80,7 @@ pub fn get_network_info() -> Result<NetworkInfo, String> {
                 &[],
             )
             .and_then(|v| v.i())
+            .or_clear(env)?;
         {
             if ip != 0 {
                 info.wifi_ip = Some(format!(

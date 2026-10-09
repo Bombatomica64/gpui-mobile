@@ -1,4 +1,4 @@
-use crate::android::jni::{self as jni_helpers, JniExt};
+use crate::android::jni::{self as jni_helpers, JniExt, JniResultExt as _};
 use jni::objects::JValue;
 
 pub fn share_text(text: &str, subject: Option<&str>) -> Result<(), String> {
@@ -15,49 +15,46 @@ pub fn share_text(text: &str, subject: Option<&str>) -> Result<(), String> {
                 jni::jni_sig!("(Ljava/lang/String;)V"),
                 &[JValue::Object(&action_send)],
             )
-            .e()?;
+            .or_clear(env)?;
 
         // intent.setType("text/plain")
         let mime = env.new_string("text/plain").e()?;
-        let _ = env
-            .call_method(
-                &intent,
-                jni::jni_str!("setType"),
-                jni::jni_sig!("(Ljava/lang/String;)Landroid/content/Intent;"),
-                &[JValue::Object(&mime)],
-            )
-            .e()?;
+        env.call_method(
+            &intent,
+            jni::jni_str!("setType"),
+            jni::jni_sig!("(Ljava/lang/String;)Landroid/content/Intent;"),
+            &[JValue::Object(&mime)],
+        )
+        .or_clear(env)?;
 
         // intent.putExtra(Intent.EXTRA_TEXT, text)
         let extra_text_key = env.new_string("android.intent.extra.TEXT").e()?;
         let extra_text_val = env.new_string(&text).e()?;
-        let _ = env
-            .call_method(
-                &intent,
-                jni::jni_str!("putExtra"),
-                jni::jni_sig!("(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;"),
-                &[
-                    JValue::Object(&extra_text_key),
-                    JValue::Object(&extra_text_val),
-                ],
-            )
-            .e()?;
+        env.call_method(
+            &intent,
+            jni::jni_str!("putExtra"),
+            jni::jni_sig!("(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;"),
+            &[
+                JValue::Object(&extra_text_key),
+                JValue::Object(&extra_text_val),
+            ],
+        )
+        .or_clear(env)?;
 
         // intent.putExtra(Intent.EXTRA_SUBJECT, subject) if provided
         if let Some(ref subj) = subject {
             let extra_subj_key = env.new_string("android.intent.extra.SUBJECT").e()?;
             let extra_subj_val = env.new_string(subj).e()?;
-            let _ = env
-                .call_method(
-                    &intent,
-                    jni::jni_str!("putExtra"),
-                    jni::jni_sig!("(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;"),
-                    &[
-                        JValue::Object(&extra_subj_key),
-                        JValue::Object(&extra_subj_val),
-                    ],
-                )
-                .e()?;
+            env.call_method(
+                &intent,
+                jni::jni_str!("putExtra"),
+                jni::jni_sig!("(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;"),
+                &[
+                    JValue::Object(&extra_subj_key),
+                    JValue::Object(&extra_subj_val),
+                ],
+            )
+            .or_clear(env)?;
         }
 
         // Intent chooser = Intent.createChooser(intent, "Share")
@@ -75,21 +72,17 @@ pub fn share_text(text: &str, subject: Option<&str>) -> Result<(), String> {
                 &[JValue::Object(&intent), JValue::Object(&chooser_title)],
             )
             .and_then(|v| v.l())
-            .e()?;
+            .or_clear(env)?;
 
         // activity.startActivity(chooser)
-        let result = env.call_method(
+        env.call_method(
             &activity,
             jni::jni_str!("startActivity"),
             jni::jni_sig!("(Landroid/content/Intent;)V"),
             &[JValue::Object(&chooser)],
-        );
-        match result {
-            Ok(_) => Ok(()),
-            Err(_) => {
-                env.exception_clear();
-                Err("Failed to start share activity".into())
-            }
-        }
+        )
+        .or_clear(env)
+        .map_err(|e| format!("Failed to start share activity: {e}"))?;
+        Ok(())
     })
 }

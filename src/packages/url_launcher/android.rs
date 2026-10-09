@@ -1,4 +1,4 @@
-use crate::android::jni::{self as jni_helpers, JniExt};
+use crate::android::jni::{self as jni_helpers, JniExt, JniResultExt as _};
 use jni::objects::JValue;
 
 pub fn launch_url(url: &str) -> Result<bool, String> {
@@ -9,39 +9,38 @@ pub fn launch_url(url: &str) -> Result<bool, String> {
         let intent = create_view_intent(env, &url)?;
 
         // activity.startActivity(intent)
-        let result = env.call_method(
-            &activity,
-            jni::jni_str!("startActivity"),
-            jni::jni_sig!("(Landroid/content/Intent;)V"),
-            &[JValue::Object(&intent)],
-        );
-        match result {
-            Ok(_) => Ok(true),
-            Err(_) => {
-                env.exception_clear();
-                Ok(false)
-            }
-        }
+        let started = env
+            .call_method(
+                &activity,
+                jni::jni_str!("startActivity"),
+                jni::jni_sig!("(Landroid/content/Intent;)V"),
+                &[JValue::Object(&intent)],
+            )
+            .or_catch(
+                env,
+                jni::jni_str!("android/content/ActivityNotFoundException"),
+            )?;
+        Ok(started.is_some())
     })
 }
 
 pub fn can_launch_url(url: &str) -> Result<bool, String> {
     let url = url.to_owned();
     jni_helpers::with_env(|env| {
-        let activity = jni_helpers::activity(env)?;
+        let context = jni_helpers::application_context(env)?;
 
         let intent = create_view_intent(env, &url)?;
 
-        // activity.getPackageManager()
+        // context.getPackageManager()
         let pm = env
             .call_method(
-                &activity,
+                &context,
                 jni::jni_str!("getPackageManager"),
                 jni::jni_sig!("()Landroid/content/pm/PackageManager;"),
                 &[],
             )
             .and_then(|v| v.l())
-            .e()?;
+            .or_clear(env)?;
         if pm.is_null() {
             return Err("getPackageManager returned null".into());
         }
@@ -54,15 +53,9 @@ pub fn can_launch_url(url: &str) -> Result<bool, String> {
                 jni::jni_sig!("(Landroid/content/Intent;I)Landroid/content/pm/ResolveInfo;"),
                 &[JValue::Object(&intent), JValue::Int(0)],
             )
-            .and_then(|v| v.l());
-
-        match resolved {
-            Ok(r) => Ok(!r.is_null()),
-            Err(_) => {
-                env.exception_clear();
-                Ok(false)
-            }
-        }
+            .and_then(|v| v.l())
+            .or_clear(env)?;
+        Ok(!resolved.is_null())
     })
 }
 
@@ -81,7 +74,7 @@ fn create_view_intent<'local>(
             &[JValue::Object(&jurl)],
         )
         .and_then(|v| v.l())
-        .e()?;
+        .or_clear(env)?;
     if uri.is_null() {
         return Err(format!("Uri.parse returned null for: {url}"));
     }
@@ -94,7 +87,7 @@ fn create_view_intent<'local>(
             jni::jni_sig!("(Ljava/lang/String;Landroid/net/Uri;)V"),
             &[JValue::Object(&action_view), JValue::Object(&uri)],
         )
-        .e()?;
+        .or_clear(env)?;
 
     Ok(intent)
 }

@@ -178,13 +178,25 @@ fn accessibility_manager(
 fn with_host_view<T>(
     f: impl FnOnce(&mut JNIEnv, &JObject) -> accesskit_android::jni::errors::Result<T>,
 ) -> Result<T, String> {
+    // Take a local reference to the Activity: unlike a raw global one it stays valid
+    // for this frame even if the Activity is destroyed and its global reference
+    // deleted meanwhile.
+    super::jni::with_env(|env| {
+        let activity = super::jni::activity(env)?;
+        with_host_view_of(activity.as_raw().cast(), f)
+    })
+}
+
+fn with_host_view_of<T>(
+    activity: *mut std::ffi::c_void,
+    f: impl FnOnce(&mut JNIEnv, &JObject) -> accesskit_android::jni::errors::Result<T>,
+) -> Result<T, String> {
     let vm = super::jni::java_vm();
-    let activity = super::jni::activity_as_ptr();
-    if vm.is_null() || activity.is_null() {
-        return Err("JavaVM or Activity not available".into());
+    if vm.is_null() {
+        return Err("JavaVM not available".into());
     }
-    // SAFETY: both pointers come from the running JVM; the Activity is a global
-    // reference that `super::jni` keeps alive.
+    // SAFETY: `vm` is the running JVM; `activity` is a local reference in the caller's
+    // frame on this thread, which outlives this call.
     let vm = unsafe { JavaVM::from_raw(vm.cast()) }.map_err(|e| e.to_string())?;
     let activity = unsafe { JObject::from_raw(activity.cast()) };
     // `InjectingAdapter::update_if_active` expects the calling thread to stay attached.

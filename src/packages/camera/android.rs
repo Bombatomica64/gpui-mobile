@@ -2,7 +2,7 @@ use super::{
     CameraDescription, CameraHandle, CameraLensDirection, CapturedImage, ExposureMode, FlashMode,
     FocusMode, RecordedVideo, ResolutionPreset,
 };
-use crate::android::jni::{self as jni_helpers, JniExt};
+use crate::android::jni::{self as jni_helpers, JniExt, JniResultExt as _};
 use jni::objects::{JObject, JValue};
 
 const HELPER_CLASS: &str = "dev.gpui.mobile.GpuiCamera";
@@ -21,10 +21,7 @@ pub fn available_cameras() -> Result<Vec<CameraDescription>, String> {
                 &[JValue::Object(&activity)],
             )
             .and_then(|v| v.l())
-            .map_err(|e| {
-                env.exception_clear();
-                e.to_string()
-            })?;
+            .or_clear(env)?;
 
         if result.is_null() {
             return Ok(vec![]);
@@ -84,10 +81,7 @@ pub fn create_camera(
                 ],
             )
             .and_then(|v| v.i())
-            .map_err(|e| {
-                env.exception_clear();
-                e.to_string()
-            })?;
+            .or_clear(env)?;
 
         if handle_id < 0 {
             return Err("Failed to create camera session".into());
@@ -106,10 +100,7 @@ pub fn stop_preview_session(handle: &CameraHandle) -> Result<(), String> {
             jni::jni_sig!("(I)V"),
             &[JValue::Int(handle.id as i32)],
         )
-        .map_err(|e| {
-            env.exception_clear();
-            e.to_string()
-        })?;
+        .or_clear(env)?;
         Ok(())
     })
 }
@@ -127,10 +118,7 @@ pub fn take_picture(handle: &CameraHandle) -> Result<CapturedImage, String> {
                 &[JValue::Int(handle.id as i32)],
             )
             .and_then(|v| v.l())
-            .map_err(|e| {
-                env.exception_clear();
-                e.to_string()
-            })?;
+            .or_clear(env)?;
 
         if result.is_null() {
             return Err("Failed to capture photo".into());
@@ -164,10 +152,7 @@ pub fn start_video_recording(handle: &CameraHandle) -> Result<(), String> {
             jni::jni_sig!("(I)V"),
             &[JValue::Int(handle.id as i32)],
         )
-        .map_err(|e| {
-            env.exception_clear();
-            e.to_string()
-        })?;
+        .or_clear(env)?;
 
         Ok(())
     })
@@ -185,10 +170,7 @@ pub fn stop_video_recording(handle: &CameraHandle) -> Result<RecordedVideo, Stri
                 &[JValue::Int(handle.id as i32)],
             )
             .and_then(|v| v.l())
-            .map_err(|e| {
-                env.exception_clear();
-                e.to_string()
-            })?;
+            .or_clear(env)?;
 
         if result.is_null() {
             return Err("Failed to stop video recording".into());
@@ -215,10 +197,7 @@ pub fn set_flash_mode(handle: &CameraHandle, mode: FlashMode) -> Result<(), Stri
             jni::jni_sig!("(II)V"),
             &[JValue::Int(handle.id as i32), JValue::Int(mode_int)],
         )
-        .map_err(|e| {
-            env.exception_clear();
-            e.to_string()
-        })?;
+        .or_clear(env)?;
 
         Ok(())
     })
@@ -238,10 +217,7 @@ pub fn set_focus_mode(handle: &CameraHandle, mode: FocusMode) -> Result<(), Stri
             jni::jni_sig!("(II)V"),
             &[JValue::Int(handle.id as i32), JValue::Int(mode_int)],
         )
-        .map_err(|e| {
-            env.exception_clear();
-            e.to_string()
-        })?;
+        .or_clear(env)?;
 
         Ok(())
     })
@@ -261,10 +237,7 @@ pub fn set_exposure_mode(handle: &CameraHandle, mode: ExposureMode) -> Result<()
             jni::jni_sig!("(II)V"),
             &[JValue::Int(handle.id as i32), JValue::Int(mode_int)],
         )
-        .map_err(|e| {
-            env.exception_clear();
-            e.to_string()
-        })?;
+        .or_clear(env)?;
 
         Ok(())
     })
@@ -282,10 +255,7 @@ pub fn get_min_zoom(handle: &CameraHandle) -> Result<f64, String> {
                 &[JValue::Int(handle.id as i32)],
             )
             .and_then(|v| v.f())
-            .map_err(|e| {
-                env.exception_clear();
-                e.to_string()
-            })?;
+            .or_clear(env)?;
 
         Ok(result as f64)
     })
@@ -303,10 +273,7 @@ pub fn get_max_zoom(handle: &CameraHandle) -> Result<f64, String> {
                 &[JValue::Int(handle.id as i32)],
             )
             .and_then(|v| v.f())
-            .map_err(|e| {
-                env.exception_clear();
-                e.to_string()
-            })?;
+            .or_clear(env)?;
 
         Ok(result as f64)
     })
@@ -322,10 +289,7 @@ pub fn set_zoom(handle: &CameraHandle, zoom: f64) -> Result<(), String> {
             jni::jni_sig!("(IF)V"),
             &[JValue::Int(handle.id as i32), JValue::Float(zoom as f32)],
         )
-        .map_err(|e| {
-            env.exception_clear();
-            e.to_string()
-        })?;
+        .or_clear(env)?;
 
         Ok(())
     })
@@ -342,10 +306,7 @@ pub fn set_camera(handle: &CameraHandle, camera: &CameraDescription) -> Result<(
             jni::jni_sig!("(ILjava/lang/String;)V"),
             &[JValue::Int(handle.id as i32), JValue::Object(&j_camera_id)],
         )
-        .map_err(|e| {
-            env.exception_clear();
-            e.to_string()
-        })?;
+        .or_clear(env)?;
 
         Ok(())
     })
@@ -361,10 +322,7 @@ pub fn dispose(handle: CameraHandle) -> Result<(), String> {
             jni::jni_sig!("(I)V"),
             &[JValue::Int(handle.id as i32)],
         )
-        .map_err(|e| {
-            env.exception_clear();
-            e.to_string()
-        })?;
+        .or_clear(env)?;
 
         Ok(())
     })

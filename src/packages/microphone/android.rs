@@ -1,5 +1,5 @@
 use super::{AudioFormat, Recording, RecordingConfig};
-use crate::android::jni::{self as jni_helpers, get_string, JniExt};
+use crate::android::jni::{self as jni_helpers, get_string, JniResultExt as _};
 use jni::objects::JValue;
 
 const HELPER_CLASS: &str = "dev.gpui.mobile.GpuiMicrophone";
@@ -16,7 +16,7 @@ pub fn is_available() -> bool {
                 &[JValue::Object(&activity)],
             )
             .and_then(|v| v.z())
-            .e()?;
+            .or_clear(env)?;
 
         Ok(result)
     })
@@ -51,10 +51,7 @@ pub fn start_recording(config: &RecordingConfig) -> Result<String, String> {
                 ],
             )
             .and_then(|v| v.l())
-            .map_err(|e| {
-                env.exception_clear();
-                e.to_string()
-            })?;
+            .or_clear(env)?;
 
         if result.is_null() {
             return Err("Failed to start recording".into());
@@ -81,10 +78,7 @@ pub fn stop_recording() -> Result<Recording, String> {
                 &[],
             )
             .and_then(|v| v.l())
-            .map_err(|e| {
-                env.exception_clear();
-                e.to_string()
-            })?;
+            .or_clear(env)?;
 
         if result.is_null() {
             return Err("Not recording or failed to stop".into());
@@ -115,7 +109,7 @@ pub fn is_recording() -> bool {
                 &[],
             )
             .and_then(|v| v.z())
-            .e()?;
+            .or_clear(env)?;
         Ok(result)
     })
     .unwrap_or(false)
@@ -132,7 +126,7 @@ pub fn pause_recording() -> Result<(), String> {
                 &[],
             )
             .and_then(|v| v.z())
-            .e()?;
+            .or_clear(env)?;
         if success {
             Ok(())
         } else {
@@ -152,7 +146,7 @@ pub fn resume_recording() -> Result<(), String> {
                 &[],
             )
             .and_then(|v| v.z())
-            .e()?;
+            .or_clear(env)?;
         if success {
             Ok(())
         } else {
@@ -172,7 +166,7 @@ pub fn get_amplitude() -> Result<f64, String> {
                 &[],
             )
             .and_then(|v| v.d())
-            .e()?;
+            .or_clear(env)?;
         Ok(result)
     })
 }
