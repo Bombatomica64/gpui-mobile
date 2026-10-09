@@ -1300,6 +1300,29 @@ static SHOWN_KEYBOARD: std::sync::Mutex<Option<crate::KeyboardType>> = std::sync
 static DISMISSED_KEYBOARD: std::sync::Mutex<Option<crate::KeyboardType>> =
     std::sync::Mutex::new(None);
 
+/// The focused field's [`gpui::TextInputConfiguration`], applied by every show.
+static TEXT_INPUT_CONFIGURATION: std::sync::Mutex<Option<gpui::TextInputConfiguration>> =
+    std::sync::Mutex::new(None);
+
+/// `PlatformWindow::set_text_input_configuration`. GPUI forwards it before a field's
+/// `FocusGained`, but focus can also move straight from one field to another, so a
+/// keyboard already showing restarts with the new configuration.
+pub(crate) fn set_text_input_configuration(
+    configuration: gpui::TextInputConfiguration,
+    has_input: bool,
+) {
+    let mut current = TEXT_INPUT_CONFIGURATION.lock().expect("poisoned");
+    if current.as_ref() == Some(&configuration) {
+        return;
+    }
+    *current = Some(configuration);
+    drop(current);
+    let shown = *SHOWN_KEYBOARD.lock().expect("poisoned");
+    if let Some(keyboard_type) = shown.filter(|_| has_input) {
+        show_keyboard_android(keyboard_type);
+    }
+}
+
 /// IME event 5: the system already hid the keyboard; remember it for a tap to undo.
 pub(crate) fn keyboard_hidden_by_user() {
     let shown = SHOWN_KEYBOARD.lock().expect("poisoned").take();
@@ -1354,9 +1377,35 @@ pub fn show_keyboard_android(keyboard_type: crate::KeyboardType) {
         crate::KeyboardType::URL => 4,
         crate::KeyboardType::Decimal => 5,
     };
+    let (input_type, ime_options) = super::input_type::editor_info(
+        &TEXT_INPUT_CONFIGURATION
+            .lock()
+            .expect("poisoned")
+            .clone()
+            .unwrap_or_default(),
+        keyboard_type,
+    );
     let session = super::text_input::new_session();
     if let Err(error) = with_env(|env| {
         let activity = activity(env)?;
+        // Hosts written before `gpuiShowKeyboardWithInputType` only take a keyboard type.
+        if env
+            .call_method(
+                &activity,
+                jni::jni_str!("gpuiShowKeyboardWithInputType"),
+                jni::jni_sig!("(IIJ)V"),
+                &[
+                    JValue::Int(input_type),
+                    JValue::Int(ime_options),
+                    JValue::Long(session as i64),
+                ],
+            )
+            .is_ok()
+        {
+            return Ok(());
+        }
+        // The missing method left a NoSuchMethodError pending.
+        env.exception_clear();
         env.call_method(
             &activity,
             jni::jni_str!("gpuiShowKeyboard"),
