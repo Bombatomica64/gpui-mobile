@@ -57,7 +57,7 @@ use std::{
 use super::{
     dispatcher::AndroidDispatcher,
     display::{AndroidDisplay, DisplayList},
-    window::{AndroidWindow, WindowList},
+    window::{AndroidWindow, SafeAreaInsets, WindowList},
     AndroidBackend,
 };
 use gpui_wgpu::GpuContext;
@@ -639,6 +639,20 @@ impl AndroidPlatform {
     /// Returns the primary (first) window, if any.
     pub fn primary_window(&self) -> Option<Arc<AndroidWindow>> {
         self.state.lock().windows.primary().cloned()
+    }
+
+    /// Safe area insets of the active window (else the primary one), in logical
+    /// pixels. Zero when there is no window.
+    pub fn safe_area_insets(&self) -> SafeAreaInsets {
+        let state = self.state.lock();
+        let window = state
+            .windows
+            .iter()
+            .find(|window| window.is_active())
+            .or_else(|| state.windows.primary());
+        window.map_or_else(SafeAreaInsets::default, |window| {
+            window.safe_area_insets_logical()
+        })
     }
 
     /// Returns the number of live windows.

@@ -40,6 +40,8 @@
 //!    `onConfigurationChanged`, or its window keeps the old night mode until resumed.
 //! 4. From `onTouchEvent`, `dispatchKeyEvent` and the `InputConnection`:
 //!    [`motion_event`], [`key`], [`ime_event`].
+//! 5. From `View.OnApplyWindowInsetsListener`, if the host draws behind the system
+//!    bars: [`insets_changed`].
 //!
 //! The Activity must also expose the Java methods `jni.rs` calls back into for the IME
 //! (`gpuiShowKeyboard`, `gpuiHideKeyboard`, `gpuiResetComposition`); `GpuiInputActivity`
@@ -72,6 +74,7 @@ use gpui::{App, Application, ApplicationHandle};
 use ndk::native_window::NativeWindow;
 
 use super::platform::{AndroidPlatform, SharedPlatform};
+use super::window::SafeAreaInsets;
 use crate::android::{AndroidKeyEvent, TouchPoint};
 
 /// The render thread's `ALooper`, so other threads can wake it.
@@ -124,6 +127,11 @@ enum Command {
         host: HostId,
     },
     ConfigurationChanged,
+    Insets {
+        host: HostId,
+        safe_area: SafeAreaInsets,
+        ime: f32,
+    },
     /// Input arrives on the Java UI thread but GPUI may only be touched from the
     /// render thread, so both go through the queue like everything else.
     Touch(TouchPoint),
@@ -250,6 +258,9 @@ struct HostApp {
     /// surfaces (`surfaceChanged` follows `surfaceCreated`) are ignored rather than
     /// failing — and reporting — all over again.
     failed: std::collections::HashSet<HostId>,
+    /// The latest [`insets_changed`] per host. Kept here because they can arrive
+    /// before the host's window exists, and are applied when it opens.
+    insets: std::collections::HashMap<HostId, (SafeAreaInsets, f32)>,
 }
 
 fn post(command: Command) {
@@ -323,6 +334,7 @@ fn render_thread(launch: Launch) {
         windows: std::collections::HashMap::new(),
         attached: None,
         failed: std::collections::HashSet::new(),
+        insets: std::collections::HashMap::new(),
     };
 
     loop {
@@ -353,6 +365,7 @@ fn render_thread(launch: Launch) {
                 }
                 Command::HostDestroyed { host } => {
                     app.failed.remove(&host);
+                    app.insets.remove(&host);
                     if let Some(win) = app.windows.remove(&host) {
                         win.term_window();
                         platform.close_window(win.id());
@@ -390,6 +403,14 @@ fn render_thread(launch: Launch) {
                     if let Some(win) = app.windows.get(&host) {
                         win.set_active(false);
                     }
+                }
+                Command::Insets {
+                    host,
+                    safe_area,
+                    ime,
+                } => {
+                    app.insets.insert(host, (safe_area, ime));
+                    apply_insets(&app, host);
                 }
                 Command::Touch(point) => match attached_window(&app) {
                     Some(win) => win.handle_touch(point),
@@ -434,6 +455,19 @@ fn render_thread(launch: Launch) {
     }
 }
 
+/// Give `host`'s window the insets its host last reported, if it has both. The
+/// keyboard height is process-wide, so only the attached host sets it.
+fn apply_insets(app: &HostApp, host: HostId) {
+    let (Some(win), Some(&(safe_area, ime))) = (app.windows.get(&host), app.insets.get(&host))
+    else {
+        return;
+    };
+    win.set_safe_area_insets(safe_area);
+    if app.attached == Some(host) {
+        crate::set_keyboard_height(ime / win.scale_factor());
+    }
+}
+
 /// The window the live surface belongs to, or `None` while nothing is attached.
 fn attached_window(app: &HostApp) -> Option<Arc<super::window::AndroidWindow>> {
     app.attached
@@ -472,6 +506,7 @@ fn on_surface_created(
                 CURRENT_SURFACE.store(incoming, Ordering::SeqCst);
                 app.attached = Some(host);
                 log::info!("gpui-main: host {host} re-attached to its window");
+                apply_insets(app, host);
                 // The Java `InputProxy` died with the old Activity while GPUI still
                 // considers the same field focused; ask the new Activity for the IME.
                 super::jni::restore_keyboard();
@@ -507,6 +542,7 @@ fn on_surface_created(
     win.set_active(true);
     app.windows.insert(host, Arc::clone(&win));
     app.attached = Some(host);
+    apply_insets(app, host);
 
     if app.handle.is_none() {
         // Without an `AndroidApp` to drive, `AndroidPlatform::run` invokes the
@@ -693,6 +729,24 @@ pub fn ime_event(session: u64, kind: i32, text: String, start: usize, end: usize
 /// Applies the system night mode to every host's window.
 pub fn configuration_changed() {
     post(Command::ConfigurationChanged);
+}
+
+/// Report the parts of the surface that system UI covers, in physical pixels
+/// relative to the surface: `safe_area` for the status and navigation bars and
+/// the display cutout, `ime` for the software keyboard (0 when hidden).
+///
+/// Call from `View.OnApplyWindowInsetsListener` on the view that holds the
+/// surface, typically with `Type.systemBars() | Type.displayCutout()` and
+/// `Type.ime()`. Apps read them with [`crate::safe_area_insets`] and
+/// [`crate::keyboard_height`], in logical pixels; GPUI re-lays out when they
+/// change. Without this call they stay zero, which is right for a host that
+/// keeps the surface between the system bars.
+pub fn insets_changed(host: HostId, safe_area: SafeAreaInsets, ime: f32) {
+    post(Command::Insets {
+        host,
+        safe_area,
+        ime,
+    });
 }
 
 pub fn resumed(host: HostId) {

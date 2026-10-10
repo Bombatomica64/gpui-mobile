@@ -285,7 +285,7 @@ pub enum WindowAppearance {
 /// These represent the areas of the screen occupied by system UI elements
 /// (status bar, navigation bar, camera notch, etc.) that the app content
 /// should avoid drawing into — or at least pad/account for.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct SafeAreaInsets {
     /// Top inset in device pixels (status bar / camera notch).
     pub top: f32,
@@ -1063,6 +1063,21 @@ impl AndroidWindow {
     pub fn safe_area_insets_logical(&self) -> SafeAreaInsets {
         let state = self.state.lock();
         state.safe_area_insets.to_logical(state.scale_factor)
+    }
+
+    /// Store safe area insets the host measured (physical pixels), and let GPUI
+    /// re-lay out if they changed: an inset change, such as the status bar
+    /// hiding, does not always come with a resize.
+    pub fn set_safe_area_insets(&self, insets: SafeAreaInsets) {
+        {
+            let mut state = self.state.lock();
+            if state.safe_area_insets == insets {
+                return;
+            }
+            state.safe_area_insets = insets;
+        }
+        log::info!("safe_area_insets set by host: {insets:?} (physical px)");
+        self.notify_resize();
     }
 
     /// Update the safe area insets from the content rect provided by the system.
