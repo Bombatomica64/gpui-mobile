@@ -324,8 +324,9 @@ pub fn set_keyboard_height(height: f32) {
 /// Query the safe area insets from the platform.
 ///
 /// Returns `(top, bottom, left, right)` in logical points.
-/// On iOS this queries `safeAreaInsets` from the UIView.
-/// On Android use the `AndroidWindow::safe_area_insets_logical()` method instead.
+/// On iOS this queries `safeAreaInsets` from the UIView. On Android it returns the
+/// active window's insets: from the content rect on the `android-activity` path,
+/// from [`android::host::insets_changed`] on the host-driven one.
 /// On unsupported platforms returns zeros.
 pub fn safe_area_insets() -> (f32, f32, f32, f32) {
     #[cfg(target_os = "ios")]
@@ -339,8 +340,13 @@ pub fn safe_area_insets() -> (f32, f32, f32, f32) {
             }
         }
     }
-    #[cfg(not(target_os = "ios"))]
-    {}
+    #[cfg(target_os = "android")]
+    {
+        if let Some(platform) = android::jni::platform() {
+            let insets = platform.safe_area_insets();
+            return (insets.top, insets.bottom, insets.left, insets.right);
+        }
+    }
     (0.0, 0.0, 0.0, 0.0)
 }
 
