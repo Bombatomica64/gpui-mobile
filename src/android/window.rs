@@ -400,6 +400,8 @@ pub struct AndroidWindow {
     /// GPUI's accessibility callbacks, once a screen reader has been asked for. The
     /// screen reader follows whichever window is active.
     a11y: std::sync::Mutex<Option<super::accessibility::Handlers>>,
+    /// The host this window belongs to, on the host-driven path.
+    host: std::sync::OnceLock<super::host::HostId>,
 }
 
 // SAFETY: `WindowState` is protected by a `Mutex`.
@@ -480,6 +482,7 @@ impl AndroidWindow {
             active: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             force_render_once: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             a11y: Default::default(),
+            host: Default::default(),
         }))
     }
 
@@ -515,6 +518,7 @@ impl AndroidWindow {
             active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             force_render_once: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             a11y: Default::default(),
+            host: Default::default(),
         })
     }
 
@@ -1002,6 +1006,11 @@ impl AndroidWindow {
             // never fire; post afresh so demand raised meanwhile is served.
             super::frame_source::resume();
         }
+    }
+
+    /// Name the host this window belongs to; see [`super::host::set_activity`].
+    pub(super) fn set_host(&self, host: super::host::HostId) {
+        let _ = self.host.set(host);
     }
 
     /// Let go of the screen reader, if this window has it. On close and on drop.
@@ -1566,7 +1575,8 @@ impl PlatformWindow for AndroidPlatformWindow {
     }
 
     fn a11y_init(&self, callbacks: gpui::A11yCallbacks) {
-        let handlers = super::accessibility::Handlers::new(callbacks);
+        let handlers =
+            super::accessibility::Handlers::new(callbacks, self.window.host.get().copied());
         *self.window.a11y.lock().expect("poisoned") = Some(handlers.clone());
         super::accessibility::init(&handlers);
     }

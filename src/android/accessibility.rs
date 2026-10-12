@@ -23,6 +23,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use super::host::HostId;
 use accesskit_android::{
     jni::{
         objects::{GlobalRef, JObject, JString},
@@ -54,13 +55,14 @@ struct Adapter {
     manager: GlobalRef,
 }
 
-/// One window's GPUI callbacks, shared by every adapter its Activity gets.
+/// One window's GPUI callbacks, shared by every adapter its Activity gets, and the
+/// window's host on the host-driven path.
 #[derive(Clone)]
-pub(super) struct Handlers(Arc<Mutex<A11yCallbacks>>);
+pub(super) struct Handlers(Arc<Mutex<A11yCallbacks>>, Option<HostId>);
 
 impl Handlers {
-    pub(super) fn new(callbacks: A11yCallbacks) -> Self {
-        Self(Arc::new(Mutex::new(callbacks)))
+    pub(super) fn new(callbacks: A11yCallbacks, host: Option<HostId>) -> Self {
+        Self(Arc::new(Mutex::new(callbacks)), host)
     }
 
     fn deactivate(&self) {
@@ -145,15 +147,17 @@ impl Bridge {
         let Some(adapter) = &self.adapter else {
             return false;
         };
-        with_activity(|env, activity| Ok(Ok(env.is_same_object(&adapter.activity, activity)?)))
-            .unwrap_or(false)
+        with_activity(self.callbacks.1, |env, activity| {
+            Ok(Ok(env.is_same_object(&adapter.activity, activity)?))
+        })
+        .unwrap_or(false)
     }
 
     fn attach(&mut self) {
         // Dropping the old adapter removes its delegate from the old view.
         self.adapter = None;
         let callbacks = self.callbacks.clone();
-        match with_activity(|env, activity| {
+        match with_activity(self.callbacks.1, |env, activity| {
             let view = host_view(env, activity)?;
             if view.is_null() {
                 return Ok(Err("the Activity has no content view".into()));
@@ -262,17 +266,27 @@ fn accessibility_manager(
     env.new_global_ref(manager)
 }
 
-/// Run `f` with the window's Activity, on this thread's (permanently attached) env.
+/// Run `f` with the window's own Activity, on this thread's (permanently attached) env.
 fn with_activity<T>(
+    host: Option<HostId>,
+    f: impl FnOnce(&mut JNIEnv, &JObject) -> accesskit_android::jni::errors::Result<Result<T, String>>,
+) -> Result<T, String> {
+    match host {
+        Some(host) => super::host::with_activity(host, |activity| with_raw_activity(activity, f)),
+        None => with_raw_activity(super::jni::activity_as_ptr(), f),
+    }
+}
+
+fn with_raw_activity<T>(
+    activity: *mut std::ffi::c_void,
     f: impl FnOnce(&mut JNIEnv, &JObject) -> accesskit_android::jni::errors::Result<Result<T, String>>,
 ) -> Result<T, String> {
     let vm = super::jni::java_vm();
-    let activity = super::jni::activity_as_ptr();
     if vm.is_null() || activity.is_null() {
         return Err("JavaVM or Activity not available".into());
     }
     // SAFETY: both pointers come from the running JVM; the Activity is a global
-    // reference that `super::jni` keeps alive.
+    // reference that `super::host` or `super::jni` keeps alive for this call.
     let vm = unsafe { JavaVM::from_raw(vm.cast()) }.map_err(|e| e.to_string())?;
     let activity = unsafe { JObject::from_raw(activity.cast()) };
     // `InjectingAdapter::update_if_active` expects the calling thread to stay attached.
