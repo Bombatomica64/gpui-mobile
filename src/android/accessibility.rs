@@ -80,8 +80,13 @@ impl ActionHandler for Handlers {
 /// `PlatformWindow::a11y_init` and when the window becomes active again.
 pub(super) fn init(callbacks: &Handlers) {
     let mut bridge = BRIDGE.lock().expect("poisoned");
-    if let Some(previous) = bridge.as_ref() {
+    if let Some(previous) = bridge.as_mut() {
         if Arc::ptr_eq(&previous.callbacks.0, &callbacks.0) {
+            // An earlier attach may have failed (no JavaVM or Activity yet, a JNI
+            // error); try again rather than leaving the window unreadable.
+            if previous.adapter.is_none() {
+                previous.attach();
+            }
             return;
         }
         // The previous window is off screen; stop it building trees.
