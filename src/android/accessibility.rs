@@ -15,13 +15,16 @@
 //! Activity's `setContentView`: AppCompat moves `android.R.id.content` there. A
 //! recreated Activity has new views, so the adapter follows it then too.
 //!
-//! This adapter version has no "screen reader stopped" callback and raises events
-//! without checking whether anyone listens, which Android answers by throwing on the
-//! UI thread (`accesskit_android` 0.9 checks, but needs `accesskit` 0.25). So each
-//! update first asks `AccessibilityManager.isEnabled()`; once it is off, GPUI is told
-//! to stop building trees and a fresh adapter waits for the next screen reader.
+//! This adapter version has no "screen reader stopped" callback, and raises events from
+//! a runnable it posts to the UI thread without checking whether anyone listens, which
+//! Android answers by throwing there (`accesskit_android` 0.9 checks in that runnable,
+//! but needs `accesskit` 0.25). So each update first asks
+//! `AccessibilityManager.isEnabled()`; once it is off, GPUI is told to stop building
+//! trees and a fresh adapter waits for the next screen reader. A screen reader turned
+//! off after that check but before the runnable runs still throws; only the adapter
+//! can close that window.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use super::host::HostId;
 use accesskit_android::{
@@ -38,6 +41,12 @@ use gpui::{
 
 static BRIDGE: Mutex<Option<Bridge>> = Mutex::new(None);
 
+/// The JavaVM in `accesskit_android`'s jni version.
+static VM: OnceLock<JavaVM> = OnceLock::new();
+
+/// `android.view.accessibility.AccessibilityManager`, one per process.
+static MANAGER: OnceLock<GlobalRef> = OnceLock::new();
+
 /// `android.R.id.content`.
 const CONTENT_VIEW_ID: i32 = 0x0102_0002;
 
@@ -50,9 +59,6 @@ struct Adapter {
     inner: InjectingAdapter,
     /// The Activity whose view `inner` is on.
     activity: GlobalRef,
-    vm: JavaVM,
-    /// `android.view.accessibility.AccessibilityManager`.
-    manager: GlobalRef,
 }
 
 /// One window's GPUI callbacks, shared by every adapter its Activity gets, and the
@@ -108,6 +114,8 @@ pub(super) fn init(callbacks: &Handlers) {
 
 /// `PlatformWindow::a11y_tree_update`, on the GPUI thread that called [`init`].
 pub(super) fn update(callbacks: &Handlers, tree: TreeUpdate) {
+    // Outside the lock: a JNI call every frame should not hold up `init`.
+    let enabled = is_accessibility_enabled();
     let mut bridge = BRIDGE.lock().expect("poisoned");
     let Some(bridge) = bridge
         .as_mut()
@@ -118,9 +126,12 @@ pub(super) fn update(callbacks: &Handlers, tree: TreeUpdate) {
     let Some(adapter) = bridge.adapter.as_mut() else {
         return;
     };
-    if adapter.is_accessibility_enabled() {
+    if enabled {
         adapter.inner.update_if_active(|| tree);
-        adapter.clear_exception();
+        // Raising events calls into Java; don't leave its exception to the next caller.
+        if let Ok(mut env) = vm().and_then(|vm| vm.get_env().map_err(|e| e.to_string())) {
+            let _ = clear_exception(&mut env, Ok(()));
+        }
         return;
     }
     // The screen reader has gone. Stop GPUI building trees, and swap in an adapter
@@ -170,12 +181,12 @@ impl Bridge {
                     "the view already has an accessibility delegate ({class})"
                 )));
             }
-            let manager = accessibility_manager(env, view)?;
+            if MANAGER.get().is_none() {
+                let _ = MANAGER.set(accessibility_manager(env, view)?);
+            }
             Ok(Ok(Adapter {
                 inner: InjectingAdapter::new(env, view, callbacks.clone(), callbacks),
                 activity: env.new_global_ref(activity)?,
-                vm: env.get_java_vm()?,
-                manager,
             }))
         }) {
             Ok(adapter) => self.adapter = Some(adapter),
@@ -184,26 +195,34 @@ impl Bridge {
     }
 }
 
-impl Adapter {
-    /// Raising events calls into Java; don't leave its exception to the next caller.
-    fn clear_exception(&self) {
-        if let Ok(mut env) = self.vm.get_env() {
-            let _ = clear_exception(&mut env, Ok(()));
-        }
-    }
+/// `false` until an adapter has been attached.
+fn is_accessibility_enabled() -> bool {
+    let (Some(vm), Some(manager)) = (VM.get(), MANAGER.get()) else {
+        return false;
+    };
+    let enabled = vm.get_env().and_then(|mut env| {
+        let enabled = env
+            .call_method(manager, "isEnabled", "()Z", &[])
+            .and_then(|value| value.z());
+        clear_exception(&mut env, enabled)
+    });
+    enabled.unwrap_or_else(|err| {
+        log::warn!("accessibility: AccessibilityManager.isEnabled failed: {err}");
+        false
+    })
+}
 
-    fn is_accessibility_enabled(&self) -> bool {
-        let enabled = self.vm.get_env().and_then(|mut env| {
-            let enabled = env
-                .call_method(&self.manager, "isEnabled", "()Z", &[])
-                .and_then(|value| value.z());
-            clear_exception(&mut env, enabled)
-        });
-        enabled.unwrap_or_else(|err| {
-            log::warn!("accessibility: AccessibilityManager.isEnabled failed: {err}");
-            false
-        })
+fn vm() -> Result<&'static JavaVM, String> {
+    if let Some(vm) = VM.get() {
+        return Ok(vm);
     }
+    let vm = super::jni::java_vm();
+    if vm.is_null() {
+        return Err("JavaVM not available".into());
+    }
+    // SAFETY: the pointer comes from the running JVM, which lives as long as the process.
+    let vm = unsafe { JavaVM::from_raw(vm.cast()) }.map_err(|e| e.to_string())?;
+    Ok(VM.get_or_init(|| vm))
 }
 
 /// `accesskit_android`'s jni 0.21 returns an error for a Java exception but leaves it
@@ -281,13 +300,12 @@ fn with_raw_activity<T>(
     activity: *mut std::ffi::c_void,
     f: impl FnOnce(&mut JNIEnv, &JObject) -> accesskit_android::jni::errors::Result<Result<T, String>>,
 ) -> Result<T, String> {
-    let vm = super::jni::java_vm();
-    if vm.is_null() || activity.is_null() {
-        return Err("JavaVM or Activity not available".into());
+    if activity.is_null() {
+        return Err("Activity not available".into());
     }
-    // SAFETY: both pointers come from the running JVM; the Activity is a global
-    // reference that `super::host` or `super::jni` keeps alive for this call.
-    let vm = unsafe { JavaVM::from_raw(vm.cast()) }.map_err(|e| e.to_string())?;
+    let vm = vm()?;
+    // SAFETY: the Activity is a global reference that `super::host` or `super::jni`
+    // keeps alive for this call.
     let activity = unsafe { JObject::from_raw(activity.cast()) };
     // `InjectingAdapter::update_if_active` expects the calling thread to stay attached.
     let mut env = vm
