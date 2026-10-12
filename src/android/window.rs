@@ -265,6 +265,7 @@ pub type CloseCallback = Box<dyn FnOnce() + Send + 'static>;
 
 /// Called when the window appearance (light/dark) changes.
 pub type AppearanceCallback = Box<dyn FnMut(WindowAppearance) + Send + 'static>;
+pub type InsetsCallback = Box<dyn FnMut(gpui::WindowInsets) + Send + 'static>;
 
 // ── appearance ────────────────────────────────────────────────────────────────
 
@@ -285,7 +286,7 @@ pub enum WindowAppearance {
 /// These represent the areas of the screen occupied by system UI elements
 /// (status bar, navigation bar, camera notch, etc.) that the app content
 /// should avoid drawing into — or at least pad/account for.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct SafeAreaInsets {
     /// Top inset in device pixels (status bar / camera notch).
     pub top: f32,
@@ -333,6 +334,8 @@ struct WindowState {
     /// `WindowResized`.  The top inset accounts for the status bar / notch,
     /// and the bottom inset accounts for the navigation bar / gesture area.
     safe_area_insets: SafeAreaInsets,
+    /// Height of the software keyboard over the surface, in physical pixels.
+    ime_inset: f32,
 
     /// Current appearance.
     appearance: WindowAppearance,
@@ -365,6 +368,7 @@ struct WindowState {
     appearance_callback: Option<AppearanceCallback>,
     active_status_callback: Option<ActiveStatusCallback>,
     visibility_callback: Option<VisibilityCallback>,
+    insets_callback: Option<InsetsCallback>,
 }
 
 // SAFETY: `WindowState` is only ever accessed while holding the
@@ -460,6 +464,7 @@ impl AndroidWindow {
             height,
             scale_factor,
             safe_area_insets: SafeAreaInsets::default(),
+            ime_inset: 0.0,
             appearance: WindowAppearance::Light,
             is_active: true,
             transparent,
@@ -470,6 +475,7 @@ impl AndroidWindow {
             resize_callback: None,
             close_callback: None,
             appearance_callback: None,
+            insets_callback: None,
             active_status_callback: None,
             visibility_callback: None,
         }));
@@ -495,6 +501,7 @@ impl AndroidWindow {
             height,
             scale_factor,
             safe_area_insets: SafeAreaInsets::default(),
+            ime_inset: 0.0,
             appearance: WindowAppearance::Light,
             is_active: false,
             transparent: false,
@@ -505,6 +512,7 @@ impl AndroidWindow {
             resize_callback: None,
             close_callback: None,
             appearance_callback: None,
+            insets_callback: None,
             active_status_callback: None,
             visibility_callback: None,
         }));
@@ -1065,6 +1073,50 @@ impl AndroidWindow {
         state.safe_area_insets.to_logical(state.scale_factor)
     }
 
+    /// Store the insets the host measured (physical pixels): the system bars and
+    /// cutout, and the keyboard's height. GPUI hears of a change through
+    /// `on_insets_changed`, since it does not always come with a resize.
+    pub fn set_insets(&self, safe_area: SafeAreaInsets, ime: f32) {
+        let (insets, cb) = {
+            let mut state = self.state.lock();
+            if state.safe_area_insets == safe_area && state.ime_inset == ime {
+                return;
+            }
+            state.safe_area_insets = safe_area;
+            state.ime_inset = ime;
+            (Self::window_insets(&state), state.insets_callback.take())
+        };
+        log::info!("insets set by host: {safe_area:?}, ime {ime} (physical px)");
+        if let Some(mut cb) = cb {
+            cb(insets);
+            let mut state = self.state.lock();
+            if state.insets_callback.is_none() {
+                state.insets_callback = Some(cb);
+            }
+        }
+    }
+
+    /// The current insets in logical pixels, as GPUI's `PlatformWindow::insets`.
+    pub fn insets(&self) -> gpui::WindowInsets {
+        Self::window_insets(&self.state.lock())
+    }
+
+    fn window_insets(state: &WindowState) -> gpui::WindowInsets {
+        let safe_area = state.safe_area_insets.to_logical(state.scale_factor);
+        gpui::WindowInsets {
+            safe_area: gpui::Edges {
+                top: gpui::px(safe_area.top),
+                right: gpui::px(safe_area.right),
+                bottom: gpui::px(safe_area.bottom),
+                left: gpui::px(safe_area.left),
+            },
+            ime: gpui::Edges {
+                bottom: gpui::px(state.ime_inset / state.scale_factor),
+                ..Default::default()
+            },
+        }
+    }
+
     /// Update the safe area insets from the content rect provided by the system.
     ///
     /// `content_rect` is `(left, top, right, bottom)` in physical pixels — the
@@ -1169,6 +1221,13 @@ impl AndroidWindow {
     }
 
     /// Register a callback invoked when the appearance (light/dark) changes.
+    pub fn on_insets_changed<F>(&self, cb: F)
+    where
+        F: FnMut(gpui::WindowInsets) + Send + 'static,
+    {
+        self.state.lock().insets_callback = Some(Box::new(cb));
+    }
+
     pub fn on_appearance_changed<F>(&self, cb: F)
     where
         F: FnMut(WindowAppearance) + Send + 'static,
@@ -1922,6 +1981,21 @@ impl PlatformWindow for AndroidPlatformWindow {
         self.window.on_appearance_changed(move |_appearance| {
             let mut cb = send_callback.lock();
             cb();
+        });
+    }
+
+    fn insets(&self) -> gpui::WindowInsets {
+        self.window.insets()
+    }
+
+    fn on_insets_changed(&self, callback: Box<dyn FnMut(gpui::WindowInsets)>) {
+        // Like `on_resize`: only ever invoked on the main thread.
+        let send_callback: Box<dyn FnMut(gpui::WindowInsets) + Send> =
+            unsafe { std::mem::transmute(callback) };
+        let send_callback = Mutex::new(send_callback);
+        self.window.on_insets_changed(move |insets| {
+            let mut cb = send_callback.lock();
+            cb(insets);
         });
     }
 
