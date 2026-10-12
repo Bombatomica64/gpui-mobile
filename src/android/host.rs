@@ -352,6 +352,9 @@ fn render_thread(launch: Launch) {
                     app.failed.remove(&host);
                     if let Some(win) = app.windows.remove(&host) {
                         win.term_window();
+                        // GPUI may keep the window object for a while; the screen
+                        // reader must not.
+                        win.close_accessibility();
                         platform.close_window(win.id());
                         log::info!(
                             "gpui-main: host {host} closed, {} window(s) left",

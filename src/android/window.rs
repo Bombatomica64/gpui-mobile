@@ -1004,6 +1004,13 @@ impl AndroidWindow {
         }
     }
 
+    /// Let go of the screen reader, if this window has it. On close and on drop.
+    pub(super) fn close_accessibility(&self) {
+        if let Some(handlers) = self.a11y.lock().expect("poisoned").take() {
+            super::accessibility::close(&handlers);
+        }
+    }
+
     // ── transparency ──────────────────────────────────────────────────────────
 
     /// Enable or disable transparent compositing.
@@ -1392,6 +1399,7 @@ impl From<FreshRendererError> for anyhow::Error {
 
 impl Drop for AndroidWindow {
     fn drop(&mut self) {
+        self.close_accessibility();
         let mut state = self.state.lock();
 
         // Destroy renderer before releasing the native window.

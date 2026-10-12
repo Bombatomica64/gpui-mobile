@@ -118,6 +118,18 @@ pub(super) fn update(callbacks: &Handlers, tree: TreeUpdate) {
     bridge.attach();
 }
 
+/// The window is closing: drop its adapter, which takes the delegate off its view, so
+/// a later screen reader cannot reach the closed window's callbacks.
+pub(super) fn close(callbacks: &Handlers) {
+    let mut bridge = BRIDGE.lock().expect("poisoned");
+    if bridge
+        .as_ref()
+        .is_some_and(|bridge| Arc::ptr_eq(&bridge.callbacks.0, &callbacks.0))
+    {
+        *bridge = None;
+    }
+}
+
 /// A new Activity was registered; move the adapter onto its views.
 pub(super) fn activity_changed() {
     if let Some(bridge) = BRIDGE.lock().expect("poisoned").as_mut() {
