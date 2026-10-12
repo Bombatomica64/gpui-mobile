@@ -344,7 +344,6 @@ fn register_host_activity(env: &mut jni::Env<'_>, activity: &JObject<'_>) -> Res
             }
         }
     }
-    super::accessibility::activity_changed();
     Ok(())
 }
 

@@ -10,8 +10,10 @@
 //! and the content view on the host-driven path (it holds the `SurfaceView`).
 //!
 //! Only the active window's Activity is on screen, so one adapter serves the active
-//! window, and a window that becomes active takes it over. A recreated Activity has
-//! new views; [`super::jni::set_host_activity`] moves the adapter onto them.
+//! window, and a window that becomes active takes it over. The adapter is attached when
+//! the window becomes active (on resume, and when its surface arrives), after the
+//! Activity's `setContentView`: AppCompat moves `android.R.id.content` there. A
+//! recreated Activity has new views, so the adapter follows it then too.
 //!
 //! This adapter version has no "screen reader stopped" callback and raises events
 //! without checking whether anyone listens, which Android answers by throwing on the
@@ -45,6 +47,8 @@ struct Bridge {
 
 struct Adapter {
     inner: InjectingAdapter,
+    /// The Activity whose view `inner` is on.
+    activity: GlobalRef,
     vm: JavaVM,
     /// `android.view.accessibility.AccessibilityManager`.
     manager: GlobalRef,
@@ -83,8 +87,8 @@ pub(super) fn init(callbacks: &Handlers) {
     if let Some(previous) = bridge.as_mut() {
         if Arc::ptr_eq(&previous.callbacks.0, &callbacks.0) {
             // An earlier attach may have failed (no JavaVM or Activity yet, a JNI
-            // error); try again rather than leaving the window unreadable.
-            if previous.adapter.is_none() {
+            // error), or the Activity was recreated; attach again in both cases.
+            if !previous.is_current() {
                 previous.attach();
             }
             return;
@@ -135,19 +139,26 @@ pub(super) fn close(callbacks: &Handlers) {
     }
 }
 
-/// A new Activity was registered; move the adapter onto its views.
-pub(super) fn activity_changed() {
-    if let Some(bridge) = BRIDGE.lock().expect("poisoned").as_mut() {
-        bridge.attach();
-    }
-}
-
 impl Bridge {
+    /// Whether the adapter is on the window's current Activity.
+    fn is_current(&self) -> bool {
+        let Some(adapter) = &self.adapter else {
+            return false;
+        };
+        with_activity(|env, activity| Ok(Ok(env.is_same_object(&adapter.activity, activity)?)))
+            .unwrap_or(false)
+    }
+
     fn attach(&mut self) {
         // Dropping the old adapter removes its delegate from the old view.
         self.adapter = None;
         let callbacks = self.callbacks.clone();
-        match with_host_view(|env, view| {
+        match with_activity(|env, activity| {
+            let view = host_view(env, activity)?;
+            if view.is_null() {
+                return Ok(Err("the Activity has no content view".into()));
+            }
+            let view = &view;
             // `InjectingAdapter` panics on the UI thread, aborting the process, if the
             // view has a delegate already: the host's, or an androidx layer's.
             if let Some(class) = foreign_delegate(env, view)? {
@@ -158,6 +169,7 @@ impl Bridge {
             let manager = accessibility_manager(env, view)?;
             Ok(Ok(Adapter {
                 inner: InjectingAdapter::new(env, view, callbacks.clone(), callbacks),
+                activity: env.new_global_ref(activity)?,
                 vm: env.get_java_vm()?,
                 manager,
             }))
@@ -250,7 +262,8 @@ fn accessibility_manager(
     env.new_global_ref(manager)
 }
 
-fn with_host_view<T>(
+/// Run `f` with the window's Activity, on this thread's (permanently attached) env.
+fn with_activity<T>(
     f: impl FnOnce(&mut JNIEnv, &JObject) -> accesskit_android::jni::errors::Result<Result<T, String>>,
 ) -> Result<T, String> {
     let vm = super::jni::java_vm();
@@ -266,27 +279,29 @@ fn with_host_view<T>(
     let mut env = vm
         .attach_current_thread_permanently()
         .map_err(|e| e.to_string())?;
-    let result = env.with_local_frame(8, |env| {
-        let window = env
-            .call_method(&activity, "getWindow", "()Landroid/view/Window;", &[])?
-            .l()?;
-        let mut view = env
-            .call_method(&window, "getDecorView", "()Landroid/view/View;", &[])?
-            .l()?;
-        if super::jni::android_app().is_none() {
-            view = env
-                .call_method(
-                    &view,
-                    "findViewById",
-                    "(I)Landroid/view/View;",
-                    &[CONTENT_VIEW_ID.into()],
-                )?
-                .l()?;
-        }
-        if view.is_null() {
-            return Ok(Err("the Activity has no content view".into()));
-        }
-        f(env, &view)
-    });
+    let result = env.with_local_frame(8, |env| f(env, &activity));
     clear_exception(&mut env, result).map_err(|e| e.to_string())?
+}
+
+/// The `View` that lines up with GPUI's surface; null if the Activity has none yet.
+fn host_view<'local>(
+    env: &mut JNIEnv<'local>,
+    activity: &JObject,
+) -> accesskit_android::jni::errors::Result<JObject<'local>> {
+    let window = env
+        .call_method(activity, "getWindow", "()Landroid/view/Window;", &[])?
+        .l()?;
+    let view = env
+        .call_method(&window, "getDecorView", "()Landroid/view/View;", &[])?
+        .l()?;
+    if super::jni::android_app().is_some() {
+        return Ok(view);
+    }
+    env.call_method(
+        &view,
+        "findViewById",
+        "(I)Landroid/view/View;",
+        &[CONTENT_VIEW_ID.into()],
+    )?
+    .l()
 }

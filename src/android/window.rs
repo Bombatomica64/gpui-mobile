@@ -991,13 +991,13 @@ impl AndroidWindow {
                 }
             }
             log::info!("AndroidWindow::set_active({}) — done", active);
-            if active {
-                if let Some(handlers) = self.a11y.lock().expect("poisoned").clone() {
-                    super::accessibility::init(&handlers);
-                }
-            }
         }
         if active {
+            // Also when already active: the surface arriving is a later, safer point to
+            // attach, and a recreated Activity has new views.
+            if let Some(handlers) = self.a11y.lock().expect("poisoned").clone() {
+                super::accessibility::init(&handlers);
+            }
             // A vsync callback posted before the app left the foreground may
             // never fire; post afresh so demand raised meanwhile is served.
             super::frame_source::resume();
