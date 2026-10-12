@@ -24,8 +24,9 @@
 //! From the Java UI thread, in this order:
 //!
 //! 1. In `Activity.onCreate` — every time, recreation included — call
-//!    [`super::jni::set_host_activity`] from a JNI entry point, then [`start`] (a no-op
-//!    after the first call). `set_host_activity` must come first: it keeps the
+//!    [`set_activity`] (or [`super::jni::set_host_activity`], which does not tell
+//!    hosts apart) from a JNI entry point, then [`start`] (a no-op
+//!    after the first call). `set_activity` must come first: it keeps the
 //!    application's `AssetManager`, which the platform reads the bundled emoji font
 //!    from when it starts. (If `start` runs first, the font is loaded late, when
 //!    `set_host_activity` provides the `AssetManager`.)
@@ -66,6 +67,8 @@
 //!   `ANativeWindow_lock` is a use-after-free.
 
 use std::{
+    collections::BTreeMap,
+    ffi::c_void,
     sync::{
         atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering},
         Arc, Mutex, OnceLock,
@@ -74,6 +77,7 @@ use std::{
 };
 
 use gpui::{App, Application, ApplicationHandle};
+use jni::{objects::JObject, refs::Global};
 use ndk::native_window::NativeWindow;
 
 use super::platform::{AndroidPlatform, SharedPlatform};
@@ -170,6 +174,11 @@ type Launch = Box<dyn FnOnce(&mut App) + Send>;
 /// Builds the UI for one host window. Called once per [`HostId`], on the render thread,
 /// with the platform primed to hand GPUI that host's surface.
 type OpenWindow = Arc<dyn Fn(HostId, &mut App) + Send + Sync>;
+
+/// Each host's own Activity, from [`set_activity`]. The screen reader goes on its views:
+/// after Back, the newest Activity ([`super::jni::activity_as_ptr`]) is the finishing
+/// one, not the one on screen.
+static ACTIVITIES: Mutex<BTreeMap<HostId, Global<JObject<'static>>>> = Mutex::new(BTreeMap::new());
 
 /// Which backend a fresh GPU context is built on. See [`set_gpu_backend`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -371,6 +380,9 @@ fn render_thread(launch: Launch) {
                     app.insets.remove(&host);
                     if let Some(win) = app.windows.remove(&host) {
                         win.term_window();
+                        // GPUI may keep the window object for a while; the screen
+                        // reader must not.
+                        win.close_accessibility();
                         platform.close_window(win.id());
                         log::info!(
                             "gpui-main: host {host} closed, {} window(s) left",
@@ -542,6 +554,7 @@ fn on_surface_created(
     };
     CURRENT_SURFACE.store(incoming, Ordering::SeqCst);
     super::jni::sync_appearance(&win);
+    win.set_host(host);
     win.set_active(true);
     app.windows.insert(host, Arc::clone(&win));
     app.attached = Some(host);
@@ -595,6 +608,50 @@ pub fn surface_created(host: HostId, window: NativeWindow, scale: f32) {
     });
 }
 
+/// [`super::jni::set_host_activity`], and remember `activity` as `host`'s own, so
+/// what belongs to one host's views (the screen reader) finds that host's Activity.
+/// Call from `Activity.onCreate`, every time, recreation included.
+pub fn set_activity(
+    env: &mut jni::Env<'_>,
+    host: HostId,
+    activity: &JObject<'_>,
+) -> Result<(), String> {
+    super::jni::set_host_activity(env, activity)?;
+    if super::jni::android_app().is_some() {
+        return Ok(());
+    }
+    match env.new_global_ref(activity) {
+        Ok(activity) => {
+            ACTIVITIES.lock().expect("poisoned").insert(host, activity);
+            Ok(())
+        }
+        Err(err) => {
+            if env.exception_check() {
+                env.exception_clear();
+            }
+            Err(err.to_string())
+        }
+    }
+}
+
+/// Run `f` with `host`'s own Activity (a `jobject`), or with the newest one if the host
+/// never named it through [`set_activity`]. The Activity stays referenced until `f`
+/// returns.
+pub(super) fn with_activity<T>(
+    host: HostId,
+    f: impl FnOnce(*mut c_void) -> Result<T, String>,
+) -> Result<T, String> {
+    let activities = ACTIVITIES.lock().expect("poisoned");
+    if let Some(activity) = activities.get(&host) {
+        return f(activity.as_raw() as *mut c_void);
+    }
+    drop(activities);
+    super::jni::with_env(|env| {
+        let activity = super::jni::activity(env)?;
+        f(activity.as_raw().cast())
+    })
+}
+
 /// Build the UI for a host window. Called once per [`HostId`] on the render thread,
 /// with the platform primed so the `cx.open_window` inside lands on that host's
 /// surface — see [`AndroidPlatform::set_pending_window`].
@@ -613,6 +670,7 @@ where
 /// Call from `Activity.onDestroy` when the Activity is finishing for good — not on a
 /// configuration change, where the same [`HostId`] is expected back.
 pub fn host_destroyed(host: HostId) {
+    ACTIVITIES.lock().expect("poisoned").remove(&host);
     post(Command::HostDestroyed { host });
 }
 

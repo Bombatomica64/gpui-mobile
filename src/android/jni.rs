@@ -531,7 +531,6 @@ fn register_host_activity(env: &mut jni::Env<'_>, activity: &JObject<'_>) -> Res
             log::warn!("set_host_activity: cannot post to the UI thread: {err}");
         }
     }
-    super::accessibility::activity_changed();
     if HOST_APPLICATION.get().is_none() {
         match fetch_application_context(env, activity) {
             Ok(context) => {
@@ -941,6 +940,18 @@ fn process_input_events(app: &AndroidApp) {
                                 action,
                                 pointer_count,
                             );
+
+                            // GPUI does not use hover on mobile. With a screen reader on,
+                            // touch exploration arrives as hover events, which the
+                            // accessibility delegate on the decor view has to see.
+                            if matches!(
+                                action,
+                                MotionAction::HoverEnter
+                                    | MotionAction::HoverMove
+                                    | MotionAction::HoverExit
+                            ) {
+                                return android_activity::InputStatus::Unhandled;
+                            }
 
                             // Check if this touch lands on a platform view.
                             //
