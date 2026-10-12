@@ -250,10 +250,12 @@ fn font_has_cbdt_tables(data: &[u8]) -> bool {
 ///
 /// `path` is relative to the `assets/` directory in the APK (e.g.
 /// `"fonts/NotoColorEmoji.ttf"`).
-fn load_asset_bytes(app: &android_activity::AndroidApp, path: &str) -> anyhow::Result<Vec<u8>> {
+fn load_asset_bytes(
+    asset_manager: &ndk::asset::AssetManager,
+    path: &str,
+) -> anyhow::Result<Vec<u8>> {
     use std::ffi::CString;
 
-    let asset_manager = app.asset_manager();
     let c_path = CString::new(path)?;
 
     // Open the asset.  `AssetManager::open` returns `Option<Asset>`.
@@ -261,13 +263,45 @@ fn load_asset_bytes(app: &android_activity::AndroidApp, path: &str) -> anyhow::R
         .open(&c_path)
         .ok_or_else(|| anyhow::anyhow!("asset not found: {path}"))?;
 
-    // `Asset::buffer` returns `io::Result<&[u8]>` — the entire file mapped
-    // into memory.
-    let bytes = asset
-        .buffer()
-        .map_err(|e| anyhow::anyhow!("failed to read asset buffer for {path}: {e}"))?;
+    // Read straight into one buffer of the asset's size: the emoji font is
+    // ~10 MB, and mapping it first and copying would hold it twice.
+    let mut bytes = Vec::with_capacity(asset.length());
+    std::io::Read::read_to_end(&mut asset, &mut bytes)
+        .map_err(|e| anyhow::anyhow!("failed to read asset {path}: {e}"))?;
 
-    Ok(bytes.to_vec())
+    Ok(bytes)
+}
+
+/// The bundled CBDT emoji font, relative to the APK's `assets/` directory.
+const BUNDLED_EMOJI_FONT: &str = "fonts/NotoColorEmoji.ttf";
+
+/// The text system still waiting for the bundled emoji font. On the host-driven
+/// path the platform can start before `set_host_activity` has provided an
+/// AssetManager; the font is then loaded when it does.
+static EMOJI_FONT_PENDING: std::sync::Mutex<Option<Arc<CosmicTextSystem>>> =
+    std::sync::Mutex::new(None);
+
+/// Load the bundled emoji font into a text system that started without an
+/// AssetManager. Called by `set_host_activity` once it has one.
+pub(crate) fn load_deferred_emoji_font() {
+    let Some(text_system) = EMOJI_FONT_PENDING.lock().expect("poisoned").take() else {
+        return;
+    };
+    match crate::android::jni::with_asset_manager(|assets| {
+        load_asset_bytes(assets, BUNDLED_EMOJI_FONT)
+    }) {
+        Some(Ok(bytes)) => {
+            log::info!(
+                "loaded bundled CBDT emoji font from assets ({} bytes)",
+                bytes.len()
+            );
+            if let Err(e) = text_system.add_fonts(vec![std::borrow::Cow::Owned(bytes)]) {
+                log::warn!("failed to add bundled emoji font: {e:#}");
+            }
+        }
+        Some(Err(e)) => log::warn!("failed to load bundled emoji font from assets: {e:#}"),
+        None => log::warn!("no AssetManager available — cannot load bundled emoji font"),
+    }
 }
 
 impl AndroidPlatform {
@@ -374,10 +408,17 @@ impl AndroidPlatform {
                 }
             }
 
+            let mut emoji_deferred = false;
             if !emoji_loaded {
                 // Try loading the bundled CBDT NotoColorEmoji from APK assets.
-                if let Some(app) = crate::android::jni::android_app() {
-                    match load_asset_bytes(&app, "fonts/NotoColorEmoji.ttf") {
+                // The lock is held across the check, so a concurrent
+                // `set_host_activity` either provides the AssetManager first or
+                // finds the text system pending afterwards.
+                let mut pending = EMOJI_FONT_PENDING.lock().expect("poisoned");
+                if let Some(result) = crate::android::jni::with_asset_manager(|assets| {
+                    load_asset_bytes(assets, BUNDLED_EMOJI_FONT)
+                }) {
+                    match result {
                         Ok(bytes) => {
                             log::info!(
                                 "loaded bundled CBDT emoji font from assets ({} bytes)",
@@ -391,11 +432,16 @@ impl AndroidPlatform {
                         }
                     }
                 } else {
-                    log::debug!("no AndroidApp available — cannot load bundled emoji font");
+                    log::warn!(
+                        "no AssetManager yet — the bundled emoji font loads once \
+                         set_host_activity provides one"
+                    );
+                    *pending = Some(Arc::clone(&text_system));
+                    emoji_deferred = true;
                 }
             }
 
-            if !emoji_loaded {
+            if !emoji_loaded && !emoji_deferred {
                 log::warn!("no compatible emoji font loaded — emoji glyphs may not render");
             }
 
