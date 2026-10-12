@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 
 use accesskit_android::{
     jni::{
-        objects::{GlobalRef, JObject},
+        objects::{GlobalRef, JObject, JString},
         JNIEnv, JavaVM,
     },
     InjectingAdapter,
@@ -148,12 +148,19 @@ impl Bridge {
         self.adapter = None;
         let callbacks = self.callbacks.clone();
         match with_host_view(|env, view| {
+            // `InjectingAdapter` panics on the UI thread, aborting the process, if the
+            // view has a delegate already: the host's, or an androidx layer's.
+            if let Some(class) = foreign_delegate(env, view)? {
+                return Ok(Err(format!(
+                    "the view already has an accessibility delegate ({class})"
+                )));
+            }
             let manager = accessibility_manager(env, view)?;
-            Ok(Adapter {
+            Ok(Ok(Adapter {
                 inner: InjectingAdapter::new(env, view, callbacks.clone(), callbacks),
                 vm: env.get_java_vm()?,
                 manager,
-            })
+            }))
         }) {
             Ok(adapter) => self.adapter = Some(adapter),
             Err(err) => log::warn!("accessibility: cannot attach to the host view: {err}"),
@@ -197,6 +204,33 @@ fn clear_exception<T>(
     result
 }
 
+/// The class of `view`'s accessibility delegate, unless it has none or it is an earlier
+/// adapter's (whose removal is queued ahead of the new one on the UI thread).
+fn foreign_delegate(
+    env: &mut JNIEnv,
+    view: &JObject,
+) -> accesskit_android::jni::errors::Result<Option<String>> {
+    let delegate = env
+        .call_method(
+            view,
+            "getAccessibilityDelegate",
+            "()Landroid/view/View$AccessibilityDelegate;",
+            &[],
+        )?
+        .l()?;
+    if delegate.is_null() {
+        return Ok(None);
+    }
+    let class = env
+        .call_method(&delegate, "getClass", "()Ljava/lang/Class;", &[])?
+        .l()?;
+    let name = env
+        .call_method(&class, "getName", "()Ljava/lang/String;", &[])?
+        .l()?;
+    let name: String = env.get_string(&JString::from(name))?.into();
+    Ok((name != "dev.accesskit.android.Delegate").then_some(name))
+}
+
 fn accessibility_manager(
     env: &mut JNIEnv,
     view: &JObject,
@@ -217,7 +251,7 @@ fn accessibility_manager(
 }
 
 fn with_host_view<T>(
-    f: impl FnOnce(&mut JNIEnv, &JObject) -> accesskit_android::jni::errors::Result<T>,
+    f: impl FnOnce(&mut JNIEnv, &JObject) -> accesskit_android::jni::errors::Result<Result<T, String>>,
 ) -> Result<T, String> {
     let vm = super::jni::java_vm();
     let activity = super::jni::activity_as_ptr();
@@ -252,7 +286,7 @@ fn with_host_view<T>(
         if view.is_null() {
             return Ok(Err("the Activity has no content view".into()));
         }
-        Ok::<_, accesskit_android::jni::errors::Error>(Ok(f(env, &view)?))
+        f(env, &view)
     });
     clear_exception(&mut env, result).map_err(|e| e.to_string())?
 }
