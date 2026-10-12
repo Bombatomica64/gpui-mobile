@@ -25,7 +25,10 @@
 //!
 //! 1. In `Activity.onCreate` — every time, recreation included — call
 //!    [`super::jni::set_host_activity`] from a JNI entry point, then [`start`] (a no-op
-//!    after the first call).
+//!    after the first call). `set_host_activity` must come first: it keeps the
+//!    application's `AssetManager`, which the platform reads the bundled emoji font
+//!    from when it starts. (If `start` runs first, the font is loaded late, when
+//!    `set_host_activity` provides the `AssetManager`.)
 //! 2. From `SurfaceHolder.Callback`: [`surface_created`] in both `surfaceCreated` and
 //!    `surfaceChanged`, [`surface_destroyed`] in `surfaceDestroyed`, and
 //!    [`host_destroyed`] from `onDestroy` when the Activity is finishing.

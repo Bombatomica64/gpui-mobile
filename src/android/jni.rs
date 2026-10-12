@@ -305,8 +305,18 @@ struct HostActivity {
 /// safe areas, file pickers, `rustls-platform-verifier`) work exactly as on the
 /// `android-activity` path. A no-op when `android-activity` owns the process.
 /// Call it before `host::start`: the platform reads bundled assets (the emoji font)
-/// when it starts.
+/// when it starts. If `start` came first, the emoji font is loaded here instead.
 pub fn set_host_activity(env: &mut jni::Env<'_>, activity: &JObject<'_>) -> Result<(), String> {
+    let result = register_host_activity(env, activity);
+    // The caller may make more JNI calls before returning to Java, which a pending
+    // exception would make undefined.
+    if result.is_err() && env.exception_check() {
+        env.exception_clear();
+    }
+    result
+}
+
+fn register_host_activity(env: &mut jni::Env<'_>, activity: &JObject<'_>) -> Result<(), String> {
     if ANDROID_APP.get().is_some() {
         return Ok(());
     }
@@ -324,6 +334,7 @@ pub fn set_host_activity(env: &mut jni::Env<'_>, activity: &JObject<'_>) -> Resu
         match host_assets(env, activity) {
             Ok(assets) => {
                 let _ = HOST_ASSETS.set(assets);
+                super::platform::load_deferred_emoji_font();
             }
             Err(err) => {
                 if env.exception_check() {
@@ -348,6 +359,18 @@ struct HostAssets {
 }
 
 fn host_assets(env: &mut jni::Env<'_>, activity: &JObject<'_>) -> Result<HostAssets, String> {
+    // A local frame frees `context` and `assets` even when the caller stays in
+    // native code, e.g. on a native-attached thread.
+    env.with_local_frame(2, |env| {
+        Ok::<_, jni::errors::Error>(host_assets_in_frame(env, activity))
+    })
+    .e()?
+}
+
+fn host_assets_in_frame(
+    env: &mut jni::Env<'_>,
+    activity: &JObject<'_>,
+) -> Result<HostAssets, String> {
     let context = env
         .call_method(
             activity,
