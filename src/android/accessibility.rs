@@ -24,7 +24,10 @@
 //! off after that check but before the runnable runs still throws; only the adapter
 //! can close that window.
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::{
+    mem::ManuallyDrop,
+    sync::{Arc, Mutex, OnceLock},
+};
 
 use super::host::HostId;
 use accesskit_android::{
@@ -56,9 +59,16 @@ struct Bridge {
 }
 
 struct Adapter {
-    inner: InjectingAdapter,
+    inner: ManuallyDrop<InjectingAdapter>,
     /// The Activity whose view `inner` is on.
     activity: GlobalRef,
+}
+
+impl Drop for Adapter {
+    fn drop(&mut self) {
+        // SAFETY: `inner` is not used after this.
+        in_local_frame(|| unsafe { ManuallyDrop::drop(&mut self.inner) });
+    }
 }
 
 /// One window's GPUI callbacks, shared by every adapter its Activity gets, and the
@@ -127,7 +137,7 @@ pub(super) fn update(callbacks: &Handlers, tree: TreeUpdate) {
         return;
     };
     if enabled {
-        adapter.inner.update_if_active(|| tree);
+        in_local_frame(|| adapter.inner.update_if_active(|| tree));
         // Raising events calls into Java; don't leave its exception to the next caller.
         if let Ok(mut env) = vm().and_then(|vm| vm.get_env().map_err(|e| e.to_string())) {
             let _ = clear_exception(&mut env, Ok(()));
@@ -185,7 +195,12 @@ impl Bridge {
                 let _ = MANAGER.set(accessibility_manager(env, view)?);
             }
             Ok(Ok(Adapter {
-                inner: InjectingAdapter::new(env, view, callbacks.clone(), callbacks),
+                inner: ManuallyDrop::new(InjectingAdapter::new(
+                    env,
+                    view,
+                    callbacks.clone(),
+                    callbacks,
+                )),
                 activity: env.new_global_ref(activity)?,
             }))
         }) {
@@ -223,6 +238,24 @@ fn vm() -> Result<&'static JavaVM, String> {
     // SAFETY: the pointer comes from the running JVM, which lives as long as the process.
     let vm = unsafe { JavaVM::from_raw(vm.cast()) }.map_err(|e| e.to_string())?;
     Ok(VM.get_or_init(|| vm))
+}
+
+/// Run `f` in its own local reference frame. `accesskit_android` creates local references
+/// in every update and drop and never deletes them, and the GPUI thread stays attached,
+/// so they would pile up and keep old views alive.
+fn in_local_frame<T>(f: impl FnOnce() -> T) -> T {
+    // On a thread that is not attached, `accesskit_android` attaches only for the call,
+    // and detaching frees them.
+    let Some(env) = VM.get().and_then(|vm| vm.get_env().ok()) else {
+        return f();
+    };
+    if env.push_local_frame(16).is_err() {
+        return f();
+    }
+    let value = f();
+    // SAFETY: no local reference from inside the frame is used after it.
+    let _ = unsafe { env.pop_local_frame(&JObject::null()) };
+    value
 }
 
 /// `accesskit_android`'s jni 0.21 returns an error for a Java exception but leaves it
