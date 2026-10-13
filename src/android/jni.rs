@@ -851,10 +851,15 @@ pub fn query_night_mode_via_jni() -> bool {
         let config = ndk::configuration::Configuration::from_asset_manager(&app.asset_manager());
         config.ui_mode_night() == ndk::configuration::UiModeNight::Yes
     } else {
-        // No AndroidApp on the host-driven path: ask the application's Resources.
-        // An Activity that handles `uiMode` itself keeps a stale configuration in its
-        // AssetManager.
-        host_ui_mode().is_ok_and(|ui_mode| ui_mode & UI_MODE_NIGHT_MASK == UI_MODE_NIGHT_YES)
+        // No AndroidApp on the host-driven path: ask the host Activity's Resources,
+        // which also carry an app-local night mode (`AppCompatDelegate`).
+        match host_ui_mode() {
+            Ok(ui_mode) => is_night(ui_mode),
+            Err(err) => {
+                log::warn!("query_night_mode: cannot read uiMode, assuming Light: {err}");
+                false
+            }
+        }
     };
 
     log::debug!("query_night_mode: is_dark={}", is_dark);
@@ -865,43 +870,59 @@ pub fn query_night_mode_via_jni() -> bool {
 const UI_MODE_NIGHT_MASK: i32 = 0x30;
 const UI_MODE_NIGHT_YES: i32 = 0x20;
 
-/// `getResources().getConfiguration().uiMode` of the application context.
+fn is_night(ui_mode: i32) -> bool {
+    ui_mode & UI_MODE_NIGHT_MASK == UI_MODE_NIGHT_YES
+}
+
+/// `getResources().getConfiguration().uiMode` of the current host Activity.
 fn host_ui_mode() -> Result<i32, String> {
-    let context = HOST_APPLICATION
-        .get()
-        .ok_or("set_host_activity has not been called")?;
     with_env(|env| {
-        let resources = env
-            .call_method(
-                context,
-                jni::jni_str!("getResources"),
-                jni::jni_sig!("()Landroid/content/res/Resources;"),
-                &[],
-            )
-            .and_then(|v| v.l())
-            .or_clear(env)?;
-        let config = env
-            .call_method(
-                &resources,
-                jni::jni_str!("getConfiguration"),
-                jni::jni_sig!("()Landroid/content/res/Configuration;"),
-                &[],
-            )
-            .and_then(|v| v.l())
-            .or_clear(env)?;
-        env.get_field(&config, jni::jni_str!("uiMode"), jni::jni_sig!("I"))
-            .and_then(|v| v.i())
-            .or_clear(env)
+        let activity = activity(env)?;
+        // A local frame frees `resources` and `config`: the render thread never
+        // returns to Java.
+        let result = env.with_local_frame(2, |env| {
+            let resources = env
+                .call_method(
+                    &activity,
+                    jni::jni_str!("getResources"),
+                    jni::jni_sig!("()Landroid/content/res/Resources;"),
+                    &[],
+                )?
+                .l()?;
+            let config = env
+                .call_method(
+                    &resources,
+                    jni::jni_str!("getConfiguration"),
+                    jni::jni_sig!("()Landroid/content/res/Configuration;"),
+                    &[],
+                )?
+                .l()?;
+            env.get_field(&config, jni::jni_str!("uiMode"), jni::jni_sig!("I"))?
+                .i()
+        });
+        if result.is_err() {
+            env.exception_clear();
+        }
+        result.e()
     })
 }
 
-/// Apply the system night mode to a window.
-pub(crate) fn sync_appearance(window: &crate::android::window::AndroidWindow) {
-    window.set_appearance(if query_night_mode_via_jni() {
+/// The system night mode as a window appearance.
+pub(crate) fn query_appearance() -> crate::android::window::WindowAppearance {
+    appearance(query_night_mode_via_jni())
+}
+
+/// The appearance a `Configuration.uiMode` asks for.
+pub(crate) fn appearance_from_ui_mode(ui_mode: i32) -> crate::android::window::WindowAppearance {
+    appearance(is_night(ui_mode))
+}
+
+fn appearance(is_dark: bool) -> crate::android::window::WindowAppearance {
+    if is_dark {
         crate::android::window::WindowAppearance::Dark
     } else {
         crate::android::window::WindowAppearance::Light
-    });
+    }
 }
 
 // ── input event processing ────────────────────────────────────────────────────
@@ -1222,8 +1243,7 @@ pub fn run_event_loop(app: &AndroidApp) {
                         .unwrap_or(1.0);
 
                     if let Some(existing) = platform.primary_window() {
-                        let gpu_ctx = platform.gpu_context();
-                        match existing.init_window(native_window, gpu_ctx) {
+                        match platform.reinit_window(&existing, native_window) {
                             Ok(()) => {
                                 log::info!("InitWindow: reinitialised existing window");
                             }
@@ -1283,9 +1303,7 @@ pub fn run_event_loop(app: &AndroidApp) {
             log::debug!("deferred: ConfigChanged");
             if let Some(platform) = PLATFORM.get() {
                 platform.notify_keyboard_layout_change();
-                if let Some(win) = platform.primary_window() {
-                    sync_appearance(&win);
-                }
+                platform.refresh_appearance();
             }
         }
 

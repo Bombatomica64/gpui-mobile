@@ -279,6 +279,18 @@ pub enum WindowAppearance {
     HighContrastDark,
 }
 
+impl From<WindowAppearance> for gpui::WindowAppearance {
+    fn from(appearance: WindowAppearance) -> Self {
+        match appearance {
+            WindowAppearance::Dark => gpui::WindowAppearance::Dark,
+            WindowAppearance::HighContrastDark => gpui::WindowAppearance::VibrantDark,
+            WindowAppearance::Light | WindowAppearance::HighContrastLight => {
+                gpui::WindowAppearance::Light
+            }
+        }
+    }
+}
+
 // ── window state (interior-mutable) ──────────────────────────────────────────
 
 /// Safe area insets in physical (device) pixels.
@@ -1587,14 +1599,7 @@ impl PlatformWindow for AndroidPlatformWindow {
     }
 
     fn appearance(&self) -> gpui::WindowAppearance {
-        let local_appearance = self.window.appearance();
-        match local_appearance {
-            WindowAppearance::Dark => gpui::WindowAppearance::Dark,
-            WindowAppearance::HighContrastDark => gpui::WindowAppearance::VibrantDark,
-            WindowAppearance::Light | WindowAppearance::HighContrastLight => {
-                gpui::WindowAppearance::Light
-            }
-        }
+        self.window.appearance().into()
     }
 
     fn display(&self) -> Option<Rc<dyn PlatformDisplay>> {
