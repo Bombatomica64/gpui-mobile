@@ -617,22 +617,32 @@ impl AndroidPlatform {
     /// Deliver URLs from an implicit or explicit intent.
     pub fn deliver_open_urls(&self, urls: Vec<String>) {
         log::debug!("AndroidPlatform: delivering {} URL(s)", urls.len());
-        if let Some(cb) = self.state.lock().open_urls_callback.as_mut() {
-            cb(urls);
+        // Out of the lock while it runs: GPUI's handler may call back into the platform.
+        let callback = self.state.lock().open_urls_callback.take();
+        if let Some(mut callback) = callback {
+            callback(urls);
+            self.state.lock().open_urls_callback.get_or_insert(callback);
         }
     }
 
     /// Notify the platform that the keyboard layout has changed.
     pub fn notify_keyboard_layout_change(&self) {
-        if let Some(cb) = self.state.lock().keyboard_layout_callback.as_mut() {
-            cb();
+        let callback = self.state.lock().keyboard_layout_callback.take();
+        if let Some(mut callback) = callback {
+            callback();
+            self.state
+                .lock()
+                .keyboard_layout_callback
+                .get_or_insert(callback);
         }
     }
 
     /// Deliver a "reopen" event (app tapped in recents while already running).
     pub fn deliver_reopen(&self) {
-        if let Some(cb) = self.state.lock().reopen_callback.as_mut() {
-            cb();
+        let callback = self.state.lock().reopen_callback.take();
+        if let Some(mut callback) = callback {
+            callback();
+            self.state.lock().reopen_callback.get_or_insert(callback);
         }
     }
 
@@ -1019,20 +1029,26 @@ impl AndroidPlatform {
     /// Should be called from the native-activity main loop on every iteration
     /// to process delayed background tasks.
     pub fn tick(&self) {
-        self.state.lock().dispatcher.tick();
+        self.dispatcher().tick();
     }
 
     /// When the next delayed background task is due; the main loop sleeps
     /// no longer than that.
     pub fn next_delayed_due(&self) -> Option<std::time::Instant> {
-        self.state.lock().dispatcher.next_delayed_due()
+        self.dispatcher().next_delayed_due()
     }
 
     /// Drain all pending main-thread tasks synchronously.
     ///
     /// Useful in headless tests where there is no real ALooper.
     pub fn flush_main_thread_tasks(&self) {
-        self.state.lock().dispatcher.flush_main_thread_tasks();
+        self.dispatcher().flush_main_thread_tasks();
+    }
+
+    /// The dispatcher, cloned out of the lock: the tasks it runs are GPUI code that
+    /// calls back into the platform, and would deadlock on `state`.
+    fn dispatcher(&self) -> Arc<AndroidDispatcher> {
+        self.state.lock().dispatcher.clone()
     }
 }
 
