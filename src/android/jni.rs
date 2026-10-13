@@ -330,21 +330,8 @@ fn register_host_activity(env: &mut jni::Env<'_>, activity: &JObject<'_>) -> Res
     slot.previous = slot.current.take();
     slot.current = Some(global);
     drop(slot);
-    if HOST_APPLICATION.get().is_none() {
-        match application_context(env, activity) {
-            Ok(context) => {
-                let _ = HOST_APPLICATION.set(context);
-            }
-            Err(err) => {
-                if env.exception_check() {
-                    env.exception_clear();
-                }
-                log::warn!("set_host_activity: no application context: {err}");
-            }
-        }
-    }
-    if let (None, Some(context)) = (HOST_ASSETS.get(), HOST_APPLICATION.get()) {
-        match host_assets(env, context) {
+    if HOST_ASSETS.get().is_none() {
+        match host_assets(env, activity) {
             Ok(assets) => {
                 let _ = HOST_ASSETS.set(assets);
                 super::platform::load_deferred_emoji_font();
@@ -360,15 +347,30 @@ fn register_host_activity(env: &mut jni::Env<'_>, activity: &JObject<'_>) -> Res
     Ok(())
 }
 
-/// The application context, taken from the first host Activity and kept for the
-/// life of the process. Its configuration follows system-wide changes such as night
-/// mode, whichever Activity is in front and whatever it handles itself.
-static HOST_APPLICATION: OnceLock<jni::refs::Global<JObject<'static>>> = OnceLock::new();
+/// The application's `AssetManager`, which `android-activity` provides on the
+/// other path. Taken once, from the first host Activity's application context, and
+/// kept for the life of the process.
+static HOST_ASSETS: OnceLock<HostAssets> = OnceLock::new();
 
-fn application_context(
+struct HostAssets {
+    /// Keeps the Java `AssetManager`, and so the native one, alive.
+    _java: jni::refs::Global<JObject<'static>>,
+    native: ndk::asset::AssetManager,
+}
+
+fn host_assets(env: &mut jni::Env<'_>, activity: &JObject<'_>) -> Result<HostAssets, String> {
+    // A local frame frees `context` and `assets` even when the caller stays in
+    // native code, e.g. on a native-attached thread.
+    env.with_local_frame(2, |env| {
+        Ok::<_, jni::errors::Error>(host_assets_in_frame(env, activity))
+    })
+    .e()?
+}
+
+fn host_assets_in_frame(
     env: &mut jni::Env<'_>,
     activity: &JObject<'_>,
-) -> Result<jni::refs::Global<JObject<'static>>, String> {
+) -> Result<HostAssets, String> {
     let context = env
         .call_method(
             activity,
@@ -378,39 +380,9 @@ fn application_context(
         )
         .and_then(|value| value.l())
         .e()?;
-    if context.is_null() {
-        return Err("getApplicationContext returned null".into());
-    }
-    env.new_global_ref(&context).e()
-}
-
-/// The application's `AssetManager`, which `android-activity` provides on the
-/// other path. Taken once, from the host application context, and kept for the
-/// life of the process.
-static HOST_ASSETS: OnceLock<HostAssets> = OnceLock::new();
-
-struct HostAssets {
-    /// Keeps the Java `AssetManager`, and so the native one, alive.
-    _java: jni::refs::Global<JObject<'static>>,
-    native: ndk::asset::AssetManager,
-}
-
-fn host_assets(env: &mut jni::Env<'_>, context: &JObject<'_>) -> Result<HostAssets, String> {
-    // A local frame frees `assets` even when the caller stays in native code, e.g.
-    // on a native-attached thread.
-    env.with_local_frame(1, |env| {
-        Ok::<_, jni::errors::Error>(host_assets_in_frame(env, context))
-    })
-    .e()?
-}
-
-fn host_assets_in_frame(
-    env: &mut jni::Env<'_>,
-    context: &JObject<'_>,
-) -> Result<HostAssets, String> {
     let assets = env
         .call_method(
-            context,
+            &context,
             jni::jni_str!("getAssets"),
             jni::jni_sig!("()Landroid/content/res/AssetManager;"),
             &[],
@@ -534,10 +506,15 @@ pub fn query_night_mode_via_jni() -> bool {
         let config = ndk::configuration::Configuration::from_asset_manager(&app.asset_manager());
         config.ui_mode_night() == ndk::configuration::UiModeNight::Yes
     } else {
-        // No AndroidApp on the host-driven path: ask the application's Resources.
-        // An Activity that handles `uiMode` itself keeps a stale configuration in its
-        // AssetManager.
-        host_ui_mode().is_ok_and(|ui_mode| ui_mode & UI_MODE_NIGHT_MASK == UI_MODE_NIGHT_YES)
+        // No AndroidApp on the host-driven path: ask the host Activity's Resources,
+        // which also carry an app-local night mode (`AppCompatDelegate`).
+        match host_ui_mode() {
+            Ok(ui_mode) => is_night(ui_mode),
+            Err(err) => {
+                log::warn!("query_night_mode: cannot read uiMode, assuming Light: {err}");
+                false
+            }
+        }
     };
 
     log::debug!("query_night_mode: is_dark={}", is_dark);
@@ -548,16 +525,20 @@ pub fn query_night_mode_via_jni() -> bool {
 const UI_MODE_NIGHT_MASK: i32 = 0x30;
 const UI_MODE_NIGHT_YES: i32 = 0x20;
 
-/// `getResources().getConfiguration().uiMode` of the application context.
+fn is_night(ui_mode: i32) -> bool {
+    ui_mode & UI_MODE_NIGHT_MASK == UI_MODE_NIGHT_YES
+}
+
+/// `getResources().getConfiguration().uiMode` of the current host Activity.
 fn host_ui_mode() -> Result<i32, String> {
-    let context = HOST_APPLICATION
-        .get()
-        .ok_or("set_host_activity has not been called")?;
     with_env(|env| {
-        let result = (|| {
+        let activity = activity(env)?;
+        // A local frame frees `resources` and `config`: the render thread never
+        // returns to Java.
+        let result = env.with_local_frame(2, |env| {
             let resources = env
                 .call_method(
-                    context,
+                    &activity,
                     jni::jni_str!("getResources"),
                     jni::jni_sig!("()Landroid/content/res/Resources;"),
                     &[],
@@ -573,7 +554,7 @@ fn host_ui_mode() -> Result<i32, String> {
                 .l()?;
             env.get_field(&config, jni::jni_str!("uiMode"), jni::jni_sig!("I"))?
                 .i()
-        })();
+        });
         if result.is_err() {
             env.exception_clear();
         }
@@ -581,13 +562,22 @@ fn host_ui_mode() -> Result<i32, String> {
     })
 }
 
-/// Apply the system night mode to a window.
-pub(crate) fn sync_appearance(window: &crate::android::window::AndroidWindow) {
-    window.set_appearance(if query_night_mode_via_jni() {
+/// The system night mode as a window appearance.
+pub(crate) fn query_appearance() -> crate::android::window::WindowAppearance {
+    appearance(query_night_mode_via_jni())
+}
+
+/// The appearance a `Configuration.uiMode` asks for.
+pub(crate) fn appearance_from_ui_mode(ui_mode: i32) -> crate::android::window::WindowAppearance {
+    appearance(is_night(ui_mode))
+}
+
+fn appearance(is_dark: bool) -> crate::android::window::WindowAppearance {
+    if is_dark {
         crate::android::window::WindowAppearance::Dark
     } else {
         crate::android::window::WindowAppearance::Light
-    });
+    }
 }
 
 // ── input event processing ────────────────────────────────────────────────────
@@ -884,8 +874,7 @@ pub fn run_event_loop(app: &AndroidApp) {
                         .unwrap_or(1.0);
 
                     if let Some(existing) = platform.primary_window() {
-                        let gpu_ctx = platform.gpu_context();
-                        match existing.init_window(native_window, gpu_ctx) {
+                        match platform.reinit_window(&existing, native_window) {
                             Ok(()) => {
                                 log::info!("InitWindow: reinitialised existing window");
                             }
@@ -945,9 +934,7 @@ pub fn run_event_loop(app: &AndroidApp) {
             log::debug!("deferred: ConfigChanged");
             if let Some(platform) = PLATFORM.get() {
                 platform.notify_keyboard_layout_change();
-                if let Some(win) = platform.primary_window() {
-                    sync_appearance(&win);
-                }
+                platform.refresh_appearance();
             }
         }
 

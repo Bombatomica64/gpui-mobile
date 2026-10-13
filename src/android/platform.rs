@@ -218,6 +218,11 @@ pub struct AndroidPlatform {
     state: Mutex<AndroidPlatformState>,
     /// Set to `true` when `quit()` is called; the main loop checks this.
     should_quit: AtomicBool,
+    /// The system night mode, as last applied to every window. What
+    /// `Platform::window_appearance` answers, so it agrees with each window's
+    /// `appearance()` and costs no JNI call. Not in `state`: GPUI asks for it from
+    /// main-thread tasks, which `flush_main_thread_tasks` runs with `state` locked.
+    appearance: Mutex<super::window::WindowAppearance>,
 }
 
 /// Check whether a TrueType/OpenType font file contains CBDT (Color Bitmap
@@ -486,6 +491,7 @@ impl AndroidPlatform {
                 preferred_backend: AndroidBackend::Vulkan,
             }),
             should_quit: AtomicBool::new(false),
+            appearance: Mutex::default(),
         }
     }
 
@@ -646,20 +652,52 @@ impl AndroidPlatform {
         scale_factor: f32,
         transparent: bool,
     ) -> Result<Arc<AndroidWindow>> {
-        let mut state = self.state.lock();
-        let window = AndroidWindow::new(
-            native_window,
-            Rc::clone(&state.gpu_context),
-            scale_factor,
-            transparent,
-        )?;
-        state.windows.push(Arc::clone(&window));
+        let window = {
+            let mut state = self.state.lock();
+            let window = AndroidWindow::new(
+                native_window,
+                Rc::clone(&state.gpu_context),
+                scale_factor,
+                transparent,
+            )?;
+            state.windows.push(Arc::clone(&window));
+            window
+        };
         log::info!(
             "AndroidPlatform::open_window — id={:#x} scale={:.1}",
             window.id(),
             scale_factor
         );
+        self.refresh_appearance();
         Ok(window)
+    }
+
+    /// Give an existing window a new surface, as when its Activity is recreated, and
+    /// re-read night mode, which may have changed while it had none.
+    pub fn reinit_window(
+        &self,
+        window: &AndroidWindow,
+        native_window: ndk::native_window::NativeWindow,
+    ) -> Result<()> {
+        window.init_window(native_window, self.gpu_context())?;
+        self.refresh_appearance();
+        Ok(())
+    }
+
+    /// Read the system night mode and apply it to every window.
+    pub fn refresh_appearance(&self) {
+        self.set_appearance(super::jni::query_appearance());
+    }
+
+    /// Apply `appearance` to every window, and answer it from
+    /// `Platform::window_appearance` from now on.
+    pub fn set_appearance(&self, appearance: super::window::WindowAppearance) {
+        *self.appearance.lock() = appearance;
+        let windows: Vec<_> = self.state.lock().windows.iter().cloned().collect();
+        // Outside the lock: a window's appearance callback calls into GPUI.
+        for window in windows {
+            window.set_appearance(appearance);
+        }
     }
 
     /// Name the window the next [`Platform::open_window`] should return.
@@ -1178,11 +1216,7 @@ impl Platform for AndroidPlatform {
     }
 
     fn window_appearance(&self) -> WindowAppearance {
-        if crate::android::jni::query_night_mode_via_jni() {
-            WindowAppearance::Dark
-        } else {
-            WindowAppearance::Light
-        }
+        (*self.appearance.lock()).into()
     }
 
     fn open_url(&self, url: &str) {

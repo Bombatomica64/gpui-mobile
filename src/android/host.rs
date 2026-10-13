@@ -40,7 +40,8 @@
 //! one for a new instance.
 //! 3. From `onResume` / `onPause`: [`resumed`] / [`paused`]. An Activity that
 //!    lists `uiMode` in `configChanges` must also call [`configuration_changed`] from
-//!    `onConfigurationChanged`, or its window keeps the old night mode until resumed.
+//!    `onConfigurationChanged` with `newConfig.uiMode`, or its window keeps the old
+//!    night mode until resumed.
 //! 4. From `onTouchEvent`, `dispatchKeyEvent` and the `InputConnection`:
 //!    [`motion_event`], [`key`], [`ime_event`].
 //!
@@ -123,7 +124,9 @@ enum Command {
     Paused {
         host: HostId,
     },
-    ConfigurationChanged,
+    ConfigurationChanged {
+        ui_mode: i32,
+    },
     /// Input arrives on the Java UI thread but GPUI may only be touched from the
     /// render thread, so both go through the queue like everything else.
     Touch(TouchPoint),
@@ -373,17 +376,15 @@ fn render_thread(launch: Launch) {
                     // wake A back up right after it paused, purely because B's surface
                     // has not arrived yet to take over as attached.
                     if let Some(win) = app.windows.get(&host) {
-                        // Night mode may have changed while another app was in front.
-                        super::jni::sync_appearance(win);
                         win.set_active(true);
                     }
+                    // Night mode may have changed while another app was in front.
+                    platform.refresh_appearance();
                 }
-                Command::ConfigurationChanged => {
+                Command::ConfigurationChanged { ui_mode } => {
                     platform.notify_keyboard_layout_change();
-                    // Night mode is process-wide: stacked hosts' windows follow too.
-                    for win in app.windows.values() {
-                        super::jni::sync_appearance(win);
-                    }
+                    // Stacked hosts' windows follow too.
+                    platform.set_appearance(super::jni::appearance_from_ui_mode(ui_mode));
                 }
                 Command::Paused { host } => {
                     platform.did_enter_background();
@@ -466,8 +467,7 @@ fn on_surface_created(
         // This host has been here before — a recreated or resumed Activity. Re-attach
         // its own window, so it comes back to the panel it left rather than whichever
         // one happened to run last.
-        let gpu = platform.gpu_context();
-        match existing.init_window(window, gpu) {
+        match platform.reinit_window(&existing, window) {
             Ok(()) => {
                 CURRENT_SURFACE.store(incoming, Ordering::SeqCst);
                 app.attached = Some(host);
@@ -485,9 +485,6 @@ fn on_surface_created(
                 return;
             }
         }
-        // A recreation is how an Activity that does not handle `uiMode` itself
-        // learns about a night mode change.
-        super::jni::sync_appearance(&existing);
         existing.set_active(true);
         return;
     }
@@ -503,7 +500,6 @@ fn on_surface_created(
         }
     };
     CURRENT_SURFACE.store(incoming, Ordering::SeqCst);
-    super::jni::sync_appearance(&win);
     win.set_active(true);
     app.windows.insert(host, Arc::clone(&win));
     app.attached = Some(host);
@@ -684,11 +680,11 @@ pub fn ime_event(session: u64, kind: i32, text: String, start: usize, end: usize
     });
 }
 
-/// Call from `Activity.onConfigurationChanged`, for an Activity that handles
-/// configuration changes (`uiMode` for night mode) instead of being recreated.
-/// Applies the system night mode to every host's window.
-pub fn configuration_changed() {
-    post(Command::ConfigurationChanged);
+/// Call from `Activity.onConfigurationChanged` with `newConfig.uiMode`, for an
+/// Activity that handles configuration changes (`uiMode` for night mode) instead of
+/// being recreated. Applies that night mode to every host's window.
+pub fn configuration_changed(ui_mode: i32) {
+    post(Command::ConfigurationChanged { ui_mode });
 }
 
 pub fn resumed(host: HostId) {
