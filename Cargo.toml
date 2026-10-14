@@ -120,7 +120,7 @@ android_logger = "0.15"
 gpui_wgpu = { package = "gpui-pre-wgpu", version = "=0.3.8" }
 
 # TalkBack: exposes GPUI's AccessKit tree (accesskit 0.24, as gpui-pre).
-accesskit_android = { version = "0.7.5", features = ["embedded-dex"] }
+accesskit_android = "0.7.5"
 
 # rustc-hash is required by the PlatformKeyboardMapper trait signature
 rustc-hash = "2"

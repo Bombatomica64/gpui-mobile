@@ -20,22 +20,20 @@
 //! Android answers by throwing there (`accesskit_android` 0.9 checks in that runnable,
 //! but needs `accesskit` 0.25). So each update first asks
 //! `AccessibilityManager.isEnabled()`; once it is off, GPUI is told to stop building
-//! trees and a fresh adapter waits for the next screen reader. A screen reader turned
-//! off after that check but before the runnable runs still throws; only the adapter
-//! can close that window.
+//! trees and a fresh adapter waits for the next screen reader. The patched injection layer
+//! also checks on the UI thread before raising queued events,
+//! closing the race between this check and event delivery.
 
 use std::{
     mem::ManuallyDrop,
     sync::{Arc, Mutex, OnceLock},
 };
 
+use super::accesskit_adapter::InjectingAdapter;
 use super::host::HostId;
-use accesskit_android::{
-    jni::{
-        objects::{GlobalRef, JObject, JString},
-        JNIEnv, JavaVM,
-    },
-    InjectingAdapter,
+use accesskit_android::jni::{
+    objects::{GlobalRef, JObject, JString},
+    JNIEnv, JavaVM,
 };
 use gpui::{
     accesskit::{ActionHandler, ActionRequest, ActivationHandler, TreeUpdate},
@@ -278,14 +276,7 @@ fn foreign_delegate(
     env: &mut JNIEnv,
     view: &JObject,
 ) -> accesskit_android::jni::errors::Result<Option<String>> {
-    let delegate = env
-        .call_method(
-            view,
-            "getAccessibilityDelegate",
-            "()Landroid/view/View$AccessibilityDelegate;",
-            &[],
-        )?
-        .l()?;
+    let delegate = super::accesskit_adapter::get_accessibility_delegate(env, view)?;
     if delegate.is_null() {
         return Ok(None);
     }
