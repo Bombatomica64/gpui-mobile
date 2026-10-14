@@ -149,6 +149,8 @@ pub fn size<T>(width: T, height: T) -> Size<T> {
 
 // ── sub-modules ──────────────────────────────────────────────────────────────
 
+mod accessibility;
+mod accesskit_adapter;
 pub mod dispatcher;
 pub mod display;
 mod document_picker;

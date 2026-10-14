@@ -1,0 +1,14 @@
+[package]
+name = "gpui-android-accessibility-regression"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "a11y_regression"
+crate-type = ["cdylib"]
+
+[dependencies]
+accesskit = "0.24.1"
+accesskit_android = "0.7.5"
+log = "0.4"
