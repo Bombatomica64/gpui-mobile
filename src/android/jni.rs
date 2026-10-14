@@ -292,6 +292,10 @@ static HOST_ACTIVITY: Mutex<HostActivity> = Mutex::new(HostActivity {
     previous: None,
 });
 
+/// Application context kept independently of the newest Activity. Its Resources
+/// follow system configuration, without an Activity's local night-mode override.
+static HOST_CONTEXT: OnceLock<jni::refs::Global<JObject<'static>>> = OnceLock::new();
+
 struct HostActivity {
     current: Option<jni::refs::Global<JObject<'static>>>,
     previous: Option<jni::refs::Global<JObject<'static>>>,
@@ -326,6 +330,22 @@ fn register_host_activity(env: &mut jni::Env<'_>, activity: &JObject<'_>) -> Res
         vm.get_raw() as *mut c_void,
         std::sync::atomic::Ordering::SeqCst,
     );
+    if HOST_CONTEXT.get().is_none() {
+        let context = env
+            .with_local_frame(1, |env| {
+                let context = env
+                    .call_method(
+                        activity,
+                        jni::jni_str!("getApplicationContext"),
+                        jni::jni_sig!("()Landroid/content/Context;"),
+                        &[],
+                    )?
+                    .l()?;
+                env.new_global_ref(&context)
+            })
+            .e()?;
+        let _ = HOST_CONTEXT.set(context);
+    }
     let mut slot = HOST_ACTIVITY.lock().expect("poisoned");
     slot.previous = slot.current.take();
     slot.current = Some(global);
@@ -506,8 +526,8 @@ pub fn query_night_mode_via_jni() -> bool {
         let config = ndk::configuration::Configuration::from_asset_manager(&app.asset_manager());
         config.ui_mode_night() == ndk::configuration::UiModeNight::Yes
     } else {
-        // No AndroidApp on the host-driven path: ask the host Activity's Resources,
-        // which also carry an app-local night mode (`AppCompatDelegate`).
+        // No AndroidApp on the host-driven path: query the application context,
+        // independent of the last Activity registered or its local night mode.
         match host_ui_mode() {
             Ok(ui_mode) => is_night(ui_mode),
             Err(err) => {
@@ -529,16 +549,18 @@ fn is_night(ui_mode: i32) -> bool {
     ui_mode & UI_MODE_NIGHT_MASK == UI_MODE_NIGHT_YES
 }
 
-/// `getResources().getConfiguration().uiMode` of the current host Activity.
+/// `getResources().getConfiguration().uiMode` of the application context.
 fn host_ui_mode() -> Result<i32, String> {
     with_env(|env| {
-        let activity = activity(env)?;
+        let context = HOST_CONTEXT
+            .get()
+            .ok_or("Application context not available")?;
         // A local frame frees `resources` and `config`: the render thread never
         // returns to Java.
         let result = env.with_local_frame(2, |env| {
             let resources = env
                 .call_method(
-                    &activity,
+                    context,
                     jni::jni_str!("getResources"),
                     jni::jni_sig!("()Landroid/content/res/Resources;"),
                     &[],
