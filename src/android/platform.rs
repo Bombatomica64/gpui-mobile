@@ -1206,6 +1206,10 @@ impl Platform for AndroidPlatform {
         _handle: AnyWindowHandle,
         _options: WindowParams,
     ) -> anyhow::Result<Box<dyn PlatformWindow>> {
+        #[cfg(feature = "offscreen")]
+        if let Some(window) = crate::offscreen::take_pending(&_options) {
+            return Ok(window);
+        }
         // On Android the native window is created by the system via
         // MainEvent::InitWindow, not by the application.  If a window
         // already exists we wrap it in an AndroidPlatformWindow and hand
@@ -1317,6 +1321,10 @@ impl Platform for AndroidPlatform {
         self.state.lock().reopen_callback = Some(unsafe {
             std::mem::transmute::<Box<dyn FnMut()>, Box<dyn FnMut() + Send>>(callback)
         });
+    }
+
+    fn on_displays_changed(&self, _callback: Box<dyn FnMut()>) {
+        // Android reports no display hot-plug configuration callback here; no-op.
     }
 
     fn set_menus(&self, _menus: Vec<Menu>, _keymap: &Keymap) {
@@ -1583,6 +1591,9 @@ impl Platform for SharedPlatform {
     }
     fn on_reopen(&self, callback: Box<dyn FnMut()>) {
         <AndroidPlatform as Platform>::on_reopen(&self.0, callback)
+    }
+    fn on_displays_changed(&self, callback: Box<dyn FnMut()>) {
+        <AndroidPlatform as Platform>::on_displays_changed(&self.0, callback)
     }
     fn set_menus(&self, menus: Vec<Menu>, keymap: &Keymap) {
         <AndroidPlatform as Platform>::set_menus(&self.0, menus, keymap)

@@ -48,6 +48,9 @@ calendar = []
 deeplink = []
 microphone = []
 media_session = []
+# Render GPUI windows into images (`gpui_mobile::offscreen`). Needs the vendored
+# `gpui-pre-wgpu` (see `[patch.crates-io]`), which exposes its headless renderer.
+offscreen = ["gpui_wgpu/offscreen", "dep:image"]
 
 [lib]
 name = "gpui_mobile"
@@ -61,9 +64,11 @@ log          = { version = "0.4", features = ["kv_unstable_serde", "serde"] }
 parking_lot  = "0.12"
 futures      = "0.3"
 raw-window-handle = "0.6"
+# Same major version as `gpui-pre-wgpu`, whose `RgbaImage` `offscreen` returns.
+image        = { version = "0.25", default-features = false, optional = true }
 
 # ── GPUI core crate (provides Platform trait, event types, geometry, etc.) ───
-gpui = { package = "gpui-pre", version = "=0.3.8", default-features = false }
+gpui = { package = "gpui-pre", version = "=0.3.9", default-features = false }
 
 # ── iOS ──────────────────────────────────────────────────────────────────────
 
@@ -86,7 +91,7 @@ block2              = "0.6"
 libc = "=0.2.189"
 
 # wgpu renderer (Metal backend on iOS/Android)
-gpui_wgpu = { package = "gpui-pre-wgpu", version = "=0.3.8", features = ["font-kit"] }
+gpui_wgpu = { package = "gpui-pre-wgpu", version = "=0.3.9", features = ["font-kit"] }
 wgpu = "29.0.4"
 
 # Text / font stack
@@ -117,10 +122,10 @@ android_logger = "0.15"
 
 # wgpu renderer (Vulkan backend on Android)
 # Android uses Cosmic Text and system fonts; font-kit pulls in desktop Fontconfig.
-gpui_wgpu = { package = "gpui-pre-wgpu", version = "=0.3.8" }
+gpui_wgpu = { package = "gpui-pre-wgpu", version = "=0.3.9" }
 
 # TalkBack: exposes GPUI's AccessKit tree (accesskit 0.24, as gpui-pre).
-accesskit_android = { version = "0.7.5", features = ["embedded-dex"] }
+accesskit_android = "0.7.5"
 
 # rustc-hash is required by the PlatformKeyboardMapper trait signature
 rustc-hash = "2"
@@ -129,7 +134,7 @@ uuid       = { version = "1", features = ["v5"] }
 # ── dev ──────────────────────────────────────────────────────────────────────
 
 [dev-dependencies]
-gpui = { package = "gpui-pre", version = "=0.3.8", default-features = false, features = ["test-support"] }
+gpui = { package = "gpui-pre", version = "=0.3.9", default-features = false, features = ["test-support"] }
 
 # ── profiles ─────────────────────────────────────────────────────────────────
 
@@ -142,3 +147,16 @@ strip         = true
 [profile.dev]
 opt-level = 0
 debug     = true
+
+# `gpui-pre-wgpu` 0.3.8 with its headless renderer behind an `offscreen` feature
+# instead of `test-support` / `bench-support`, a constructor that takes the wgpu
+# instance (iOS needs Metal), and methods that release its render target and
+# clear its sprite atlas between captures. Applications that enable `offscreen`
+# must patch it the same way.
+[patch.crates-io]
+gpui-pre-wgpu = { path = "vendor/gpui-pre-wgpu" }
+# Fork only: `android-text-input-purpose` reads `TextInputConfiguration::purpose`,
+# which only Bombatomica64/gpui-pre has (branch `mobile-lab`, rebased onto 0.3.9).
+# A dependent crate's patches do not apply to the application, so apps that use
+# this fork must patch `gpui-pre` the same way.
+gpui-pre = { git = "https://github.com/Bombatomica64/gpui-pre", branch = "mobile-lab" }

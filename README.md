@@ -89,6 +89,42 @@ cd android/gradle && ./gradlew assembleDebug
 | Android (arm64) | ✅ | API 26+ | Vulkan (preferred), GL ES 3.0 |
 | Android (armv7/x86_64) | ⚠️ Untested | API 26+ | Vulkan / GL ES |
 
+## Rendering views to images
+
+The `offscreen` feature adds `gpui_mobile::offscreen::OffscreenWindow`, a GPUI
+window drawn into a texture instead of onto the screen, for turning a view into
+an image (a share card, a long screenshot):
+
+```rust
+// Open with the view to capture, then render from an async task
+// (`render` drives the window's own frame callbacks, which borrow the `App`).
+let window = OffscreenWindow::open(size(px(390.), px(844.)), 3.0, WindowAppearance::Light, cx, |window, cx| {
+    cx.new(|cx| MyView::new(window, cx))
+})?;
+window.layout(size(px(390.), px(844.)))?; // lay out without reading pixels back, e.g. to measure content
+let image = window.render(size(px(390.), content_height))?; // image::RgbaImage
+window.close(cx);
+```
+
+Dropping an `OffscreenWindow` without calling `close` (for example when the task
+holding it is cancelled) still closes the window, on the next turn of the main
+thread's executor. The GPU device and pipelines are kept for later captures;
+once the last offscreen window closes, the render target sized to the last
+frame and the glyph and image tiles the offscreen windows uploaded are released.
+
+It needs `gpui-pre-wgpu`'s headless renderer, which upstream only builds for
+tests and benchmarks and which picks a Vulkan/GL device that iOS lacks. This
+repository vendors `gpui-pre-wgpu` 0.3.8 with that renderer behind an
+`offscreen` feature, a constructor that takes the wgpu instance, and methods
+that release its render target and clear its sprite atlas
+(`vendor/gpui-pre-wgpu`). An application enabling `offscreen` must patch it the
+same way:
+
+```toml
+[patch.crates-io]
+gpui-pre-wgpu = { git = "https://github.com/longbridge/gpui-mobile" }
+```
+
 ## Screenshots
 
 Running on a Motorola Edge 50 Pro (Android, Vulkan):

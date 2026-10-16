@@ -851,8 +851,8 @@ pub fn query_night_mode_via_jni() -> bool {
         let config = ndk::configuration::Configuration::from_asset_manager(&app.asset_manager());
         config.ui_mode_night() == ndk::configuration::UiModeNight::Yes
     } else {
-        // No AndroidApp on the host-driven path: ask the host Activity's Resources,
-        // which also carry an app-local night mode (`AppCompatDelegate`).
+        // No AndroidApp on the host-driven path: query the application context,
+        // independent of the last Activity registered or its local night mode.
         match host_ui_mode() {
             Ok(ui_mode) => is_night(ui_mode),
             Err(err) => {
@@ -874,16 +874,16 @@ fn is_night(ui_mode: i32) -> bool {
     ui_mode & UI_MODE_NIGHT_MASK == UI_MODE_NIGHT_YES
 }
 
-/// `getResources().getConfiguration().uiMode` of the current host Activity.
+/// `getResources().getConfiguration().uiMode` of the application context.
 fn host_ui_mode() -> Result<i32, String> {
     with_env(|env| {
-        let activity = activity(env)?;
+        let context = application_context(env)?;
         // A local frame frees `resources` and `config`: the render thread never
         // returns to Java.
         let result = env.with_local_frame(2, |env| {
             let resources = env
                 .call_method(
-                    &activity,
+                    &context,
                     jni::jni_str!("getResources"),
                     jni::jni_sig!("()Landroid/content/res/Resources;"),
                     &[],
