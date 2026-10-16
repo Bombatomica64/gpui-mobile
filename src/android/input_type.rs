@@ -61,9 +61,7 @@ pub(super) fn editor_info(
             TextInputPurpose::Numeric => TYPE_CLASS_NUMBER,
             TextInputPurpose::Decimal => TYPE_CLASS_NUMBER | TYPE_NUMBER_FLAG_DECIMAL,
             TextInputPurpose::Password => TYPE_CLASS_TEXT | TYPE_TEXT_VARIATION_PASSWORD,
-            TextInputPurpose::NumericPassword => {
-                TYPE_CLASS_NUMBER | TYPE_NUMBER_VARIATION_PASSWORD
-            }
+            TextInputPurpose::NumericPassword => TYPE_CLASS_NUMBER | TYPE_NUMBER_VARIATION_PASSWORD,
         },
         KeyboardType::EmailAddress => TYPE_CLASS_TEXT | TYPE_TEXT_VARIATION_EMAIL_ADDRESS,
         KeyboardType::Phone => TYPE_CLASS_PHONE,
@@ -153,7 +151,8 @@ mod tests {
 
     #[test]
     fn the_default_configuration_disables_assistance() {
-        let (input_type, _) = editor_info(&TextInputConfiguration::default(), KeyboardType::Default);
+        let (input_type, _) =
+            editor_info(&TextInputConfiguration::default(), KeyboardType::Default);
         assert_eq!(
             input_type,
             TYPE_CLASS_TEXT | TYPE_TEXT_FLAG_MULTI_LINE | TYPE_TEXT_FLAG_NO_SUGGESTIONS

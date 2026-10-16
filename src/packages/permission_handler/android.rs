@@ -95,7 +95,10 @@ pub fn request_permissions(
         .iter()
         .map(|&p| check_permission(p).map(|status| (p, status)))
         .collect::<Result<Vec<_>, _>>()?;
-    if statuses.iter().all(|(_, status)| *status == PermissionStatus::Granted) {
+    if statuses
+        .iter()
+        .all(|(_, status)| *status == PermissionStatus::Granted)
+    {
         return Ok(statuses);
     }
     jni_helpers::ensure_may_wait_for_user("permission_handler::request_permissions")?;
