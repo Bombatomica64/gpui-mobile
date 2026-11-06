@@ -1,4 +1,4 @@
-use super::VideoInfo;
+use super::{VideoInfo, VideoPlayerState};
 use objc2::encode::{Encode, Encoding, RefEncode};
 use objc2::runtime::AnyObject;
 use objc2::{class, msg_send};
@@ -200,6 +200,36 @@ pub fn is_playing(id: u32) -> Result<bool, String> {
     with_player(id, |entry| unsafe {
         let rate: f32 = msg_send![entry.player, rate];
         Ok(rate > 0.0)
+    })
+}
+
+pub fn get_state(id: u32) -> Result<VideoPlayerState, String> {
+    with_player(id, |entry| unsafe {
+        let item: *mut AnyObject = msg_send![entry.player, currentItem];
+        if item.is_null() {
+            return Ok(VideoPlayerState::Idle);
+        }
+        // AVPlayerItemStatus: 0 unknown, 1 ready to play, 2 failed.
+        let status: i64 = msg_send![item, status];
+        match status {
+            0 => return Ok(VideoPlayerState::Loading),
+            2 => return Err("AVPlayerItem failed to load".into()),
+            _ => {}
+        }
+        let rate: f32 = msg_send![entry.player, rate];
+        if rate > 0.0 {
+            return Ok(VideoPlayerState::Playing);
+        }
+        let current: CMTime = msg_send![entry.player, currentTime];
+        let duration: CMTime = msg_send![item, duration];
+        let (position_ms, duration_ms) = (cmtime_to_ms(current), cmtime_to_ms(duration));
+        Ok(if duration_ms > 0 && position_ms + 50 >= duration_ms {
+            VideoPlayerState::Completed
+        } else if position_ms > 0 {
+            VideoPlayerState::Paused
+        } else {
+            VideoPlayerState::Ready
+        })
     })
 }
 
