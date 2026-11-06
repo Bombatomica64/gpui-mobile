@@ -1,4 +1,4 @@
-use super::VideoInfo;
+use super::{VideoInfo, VideoPlayerState};
 use crate::android::jni::{self as jni_helpers, JniExt};
 use jni::objects::{JObject, JValue};
 
@@ -30,7 +30,8 @@ pub fn create_player() -> Result<u32, String> {
     })
 }
 
-pub fn set_url(id: u32, url: &str) -> Result<VideoInfo, String> {
+/// Returns `None` while a stream is being prepared in the background.
+pub fn set_url(id: u32, url: &str) -> Result<Option<VideoInfo>, String> {
     jni_helpers::with_env(|env| {
         let activity = jni_helpers::activity(env)?;
         let cls = jni_helpers::find_app_class(env, HELPER_CLASS)?;
@@ -53,7 +54,10 @@ pub fn set_url(id: u32, url: &str) -> Result<VideoInfo, String> {
                 e.to_string()
             })?;
 
-        parse_video_info(env, &result)
+        if result.is_null() {
+            return Ok(None);
+        }
+        parse_video_info(env, &result).map(Some)
     })
 }
 
@@ -274,6 +278,32 @@ pub fn is_playing(id: u32) -> Result<bool, String> {
                 e.to_string()
             })?;
         Ok(playing)
+    })
+}
+
+pub fn get_state(id: u32) -> Result<VideoPlayerState, String> {
+    jni_helpers::with_env(|env| {
+        let cls = jni_helpers::find_app_class(env, HELPER_CLASS)?;
+        let state = env
+            .call_static_method(
+                &cls,
+                jni::jni_str!("getState"),
+                jni::jni_sig!("(I)I"),
+                &[JValue::Int(id as i32)],
+            )
+            .and_then(|v| v.i())
+            .map_err(|e| {
+                env.exception_clear();
+                e.to_string()
+            })?;
+        // Codes from GpuiVideoPlayer.getState.
+        Ok(match state {
+            1 => VideoPlayerState::Loading,
+            3 => VideoPlayerState::Playing,
+            4 => VideoPlayerState::Paused,
+            5 => VideoPlayerState::Completed,
+            _ => VideoPlayerState::Ready,
+        })
     })
 }
 

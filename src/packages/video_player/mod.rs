@@ -18,15 +18,20 @@ use crate::platform_view::{
 };
 use std::sync::Arc;
 
-/// Video player state.
+/// Video player state, as reported by [`VideoPlayer::state`].
+///
+/// A source that failed to load is reported as an error by `state`, with the reason.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum VideoPlayerState {
-    Uninitialized,
-    Initialized,
+    /// No source set yet.
+    Idle,
+    /// A stream is being prepared; play, pause, seek and speed apply once it is ready.
+    Loading,
+    /// Prepared, not started.
+    Ready,
     Playing,
     Paused,
     Completed,
-    Error,
 }
 
 /// Video information returned after setting a source.
@@ -112,10 +117,17 @@ impl VideoPlayer {
     }
 
     /// Set video source from a URL.
-    pub fn set_url(&self, url: &str) -> Result<VideoInfo, String> {
+    ///
+    /// Returns the video's information if the source is ready, or `None` while it
+    /// loads. On Android a stream (http, https, rtsp) does not block the caller:
+    /// [`state`](Self::state) is `Loading` until it is ready (or an error if it
+    /// failed), [`duration`](Self::duration) and [`video_size`](Self::video_size)
+    /// are known from then, and `play`, `pause`, `seek` and `set_speed` made
+    /// meanwhile apply once it is. Local sources are prepared before returning.
+    pub fn set_url(&self, url: &str) -> Result<Option<VideoInfo>, String> {
         #[cfg(target_os = "ios")]
         {
-            ios::set_url(self.id, url)
+            ios::set_url(self.id, url).map(Some)
         }
         #[cfg(target_os = "android")]
         {
@@ -286,6 +298,23 @@ impl VideoPlayer {
         #[cfg(target_os = "android")]
         {
             android::video_size(self.id)
+        }
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
+        {
+            Err("not supported".into())
+        }
+    }
+
+    /// The player's state: `Loading` while a stream is being prepared, or an error
+    /// with the reason if it failed to load.
+    pub fn state(&self) -> Result<VideoPlayerState, String> {
+        #[cfg(target_os = "android")]
+        {
+            android::get_state(self.id)
+        }
+        #[cfg(target_os = "ios")]
+        {
+            ios::get_state(self.id)
         }
         #[cfg(not(any(target_os = "ios", target_os = "android")))]
         {
