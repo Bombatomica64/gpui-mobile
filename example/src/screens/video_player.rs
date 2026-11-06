@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::time::Duration;
 
 use gpui::{div, prelude::*, px, rgb};
-use gpui_mobile::packages::video_player::VideoPlayer;
+use gpui_mobile::packages::video_player::{VideoPlayer, VideoPlayerState};
 use gpui_mobile::packages::media_session;
 
 use super::{Router, BLUE, GREEN, LIGHT_CARD_BG, LIGHT_SUBTEXT, LIGHT_TEXT, MAUVE, RED, SURFACE0, SUBTEXT, TEXT, YELLOW};
@@ -735,10 +735,14 @@ fn load_video(index: usize, cx: &mut gpui::Context<Router>) {
         if let Some(player) = st.player.take() {
             match player.set_url(url) {
                 Ok(info) => {
-                    st.duration_ms = info.duration_ms;
-                    st.video_width = info.width;
-                    st.video_height = info.height;
-                    st.loading = false;
+                    // `None`: a stream still loading; the polling below picks up its
+                    // duration and size once it is ready, and play applies then.
+                    if let Some(info) = info {
+                        st.duration_ms = info.duration_ms;
+                        st.video_width = info.width;
+                        st.video_height = info.height;
+                        st.loading = false;
+                    }
                     let _ = player.set_volume(vol);
                     let _ = player.set_speed(spd);
                     let _ = player.set_looping(lp);
@@ -746,7 +750,7 @@ fn load_video(index: usize, cx: &mut gpui::Context<Router>) {
                     st.surface_visible = true;
 
                     // Update media session
-                    let _ = media_session::set_metadata(title, "GPUI Video", info.duration_ms);
+                    let _ = media_session::set_metadata(title, "GPUI Video", st.duration_ms);
                     let _ = media_session::set_playback_state(true, 0, spd);
                 }
                 Err(e) => {
@@ -781,8 +785,24 @@ fn start_position_polling(cx: &mut gpui::Context<Router>) {
                     let pos = p.position().ok();
                     let dur = p.duration().ok();
                     let playing = p.is_playing().unwrap_or(false);
+                    let state = st.loading.then(|| p.state());
+                    let size = p.video_size().ok();
                     drop(st);
                     let mut st = s.borrow_mut();
+                    match state {
+                        Some(Ok(VideoPlayerState::Loading)) | None => {}
+                        Some(Ok(_)) => {
+                            st.loading = false;
+                            if let Some((w, h)) = size {
+                                st.video_width = w;
+                                st.video_height = h;
+                            }
+                        }
+                        Some(Err(e)) => {
+                            st.loading = false;
+                            st.error = Some(format!("Failed to load: {}", e));
+                        }
+                    }
                     if let Some(pos) = pos {
                         st.position_ms = pos;
                     }
