@@ -14,6 +14,9 @@ import android.widget.FrameLayout;
 
 import java.io.IOException;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * Java helper for video playback using {@link MediaPlayer}.
@@ -26,8 +29,9 @@ import java.util.concurrent.CountDownLatch;
  * TextureView requires HW accel and silently renders nothing without it.
  * SurfaceView has its own compositor surface and works without HW accel.</p>
  *
- * <p>Streams are prepared asynchronously, so no call blocks on the network: until
- * the stream is ready, play, pause, seek and speed are remembered and applied then.
+ * <p>Streams are loaded on a worker thread and prepared asynchronously, so no call
+ * blocks on the network or on the decoder: until the stream is ready, play, pause,
+ * seek and speed are remembered and applied then.
  * MediaPlayer delivers its callbacks on the main thread, since the threads that
  * create players have no Looper.</p>
  */
@@ -39,6 +43,14 @@ public final class GpuiVideoPlayer {
     private static final SparseArray<SurfaceView> sSurfaces = new SparseArray<>();
     private static int sNextId = 1;
     private static final Object sLock = new Object();
+
+    /**
+     * Changes a player's source and releases players, one job at a time and in
+     * order, off the caller's thread: a later setUrl or dispose runs after an
+     * earlier one has finished with the player.
+     */
+    private static final ExecutorService sWorker =
+            Executors.newSingleThreadExecutor(r -> new Thread(r, "GpuiVideoPlayer"));
 
     /**
      * A player whose source is still being prepared, and what to do once it is.
@@ -86,32 +98,55 @@ public final class GpuiVideoPlayer {
     /**
      * Set a URL as the data source.
      *
-     * <p>A local file or content URI is prepared right away. A stream is prepared
-     * in the background; {@link #getState} reports loading until it is ready, or
-     * throws its error.</p>
+     * <p>A stream (http, https, rtsp) is loaded in the background: this returns at
+     * once, {@link #getState} reports loading until it is ready, or throws its
+     * error. A local file or content URI is prepared before returning.</p>
      *
      * @param activity The current Activity.
      * @param id       Player ID.
      * @param url      URL to play.
      * @return "duration|width|height" if the source is ready, or null while it loads.
-     * @throws IOException if the source cannot be set or a local file cannot be prepared.
+     * @throws Exception if a local source cannot be set or prepared.
      */
-    public static String setUrl(Activity activity, int id, String url) throws IOException {
-        MediaPlayer mp = resetPlayer(id);
-        // Use the String overload for http/https URLs to avoid
-        // ContentResolver trying to resolve them as content:// URIs.
+    public static String setUrl(Activity activity, int id, String url) throws Exception {
         Uri uri = Uri.parse(url);
         String scheme = uri.getScheme();
         boolean stream = "http".equals(scheme) || "https".equals(scheme)
                 || "rtsp".equals(scheme);
-        if (stream) {
-            mp.setDataSource(url);
-            prepareAsync(id, mp);
-            return null;
+        if (!stream) {
+            return loadNow(id, mp -> mp.setDataSource(activity, uri));
         }
-        mp.setDataSource(activity, uri);
-        mp.prepare();
-        return videoInfo(mp);
+
+        Pending pending = new Pending();
+        MediaPlayer mp;
+        synchronized (sLock) {
+            mp = player(id);
+            sErrors.remove(id);
+            sPending.put(id, pending);
+        }
+        // Even reset() and setDataSource() take tens of ms (tearing down a
+        // prepared decoder, opening the connection), so they run on the worker too.
+        sWorker.execute(() -> {
+            synchronized (sLock) {
+                // Superseded by a newer source, or disposed: nothing to do.
+                if (sPending.get(id) != pending) return;
+            }
+            try {
+                mp.reset();
+                mp.setOnPreparedListener(player -> onPrepared(id, pending, player));
+                mp.setOnErrorListener((player, what, extra) -> {
+                    fail(id, pending, "MediaPlayer error " + what + " (" + extra + ")");
+                    return true;
+                });
+                // The String overload, so ContentResolver does not try the URL.
+                mp.setDataSource(url);
+                mp.prepareAsync();
+            } catch (Exception e) {
+                android.util.Log.e(TAG, "setUrl failed: " + url, e);
+                fail(id, pending, e.toString());
+            }
+        });
+        return null;
     }
 
     /**
@@ -120,65 +155,74 @@ public final class GpuiVideoPlayer {
      * @param activity The current Activity.
      * @param id       Player ID.
      * @param path     File path to play.
-     * @return "duration|width|height" on success, or null on failure.
+     * @return "duration|width|height".
+     * @throws Exception if the source cannot be set or prepared.
      */
-    public static String setFilePath(Activity activity, int id, String path) throws IOException {
-        MediaPlayer mp = resetPlayer(id);
-        mp.setDataSource(path);
-        mp.prepare();
-        return videoInfo(mp);
+    public static String setFilePath(Activity activity, int id, String path) throws Exception {
+        return loadNow(id, mp -> mp.setDataSource(path));
     }
 
-    private static String videoInfo(MediaPlayer mp) {
-        return mp.getDuration() + "|" + mp.getVideoWidth() + "|" + mp.getVideoHeight();
+    private interface Source {
+        void set(MediaPlayer mp) throws IOException;
     }
 
-    /**
-     * The player, reset, with any load in progress or failed load forgotten.
-     * Under the lock, so a prepared callback of the previous source either ran
-     * before or sees its load was abandoned, and never touches the new one.
-     */
-    private static MediaPlayer resetPlayer(int id) {
+    /** Load and prepare a local source on the worker, and wait for it. */
+    private static String loadNow(int id, Source source) throws Exception {
+        MediaPlayer mp;
         synchronized (sLock) {
-            MediaPlayer mp = sPlayers.get(id);
-            if (mp == null) throw new IllegalArgumentException("No video player " + id);
+            mp = player(id);
             sPending.remove(id);
             sErrors.remove(id);
-            mp.reset();
-            return mp;
+        }
+        try {
+            return sWorker.submit(() -> {
+                mp.reset();
+                source.set(mp);
+                mp.prepare();
+                return mp.getDuration() + "|" + mp.getVideoWidth() + "|" + mp.getVideoHeight();
+            }).get();
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+            throw cause instanceof Exception ? (Exception) cause : e;
         }
     }
 
-    private static void prepareAsync(int id, MediaPlayer mp) {
-        Pending pending = new Pending();
+    /** The player with this ID; call with {@code sLock} held. */
+    private static MediaPlayer player(int id) {
+        MediaPlayer mp = sPlayers.get(id);
+        if (mp == null) throw new IllegalArgumentException("No video player " + id);
+        return mp;
+    }
+
+    /** Runs on the main thread when {@code pending}'s source is prepared. */
+    private static void onPrepared(int id, Pending pending, MediaPlayer player) {
         synchronized (sLock) {
-            sPending.put(id, pending);
-        }
-        mp.setOnPreparedListener(player -> {
-            synchronized (sLock) {
-                // Gone if the player was disposed or given a new source meanwhile.
-                if (sPending.get(id) != pending) return;
-                sPending.remove(id);
-                try {
-                    if (pending.speed > 0) applySpeed(player, pending.speed);
-                    // Seeking also draws the first frame on a surface attached while loading.
-                    if (pending.seekMs >= 0 || !pending.playWhenReady) {
-                        seekTo(player, Math.max(pending.seekMs, 0));
-                    }
-                    if (pending.playWhenReady) player.start();
-                } catch (IllegalStateException e) {
-                    android.util.Log.e(TAG, "applying calls made while loading failed", e);
+            // Gone if the player was disposed or given a new source meanwhile. A
+            // newer setUrl replaces it under this lock, before its worker job resets
+            // the player, so these calls never reach a reset player.
+            if (sPending.get(id) != pending) return;
+            sPending.remove(id);
+            try {
+                if (pending.speed > 0) applySpeed(player, pending.speed);
+                // Seeking also draws the first frame on a surface attached while loading.
+                if (pending.seekMs >= 0 || !pending.playWhenReady) {
+                    seekTo(player, Math.max(pending.seekMs, 0));
                 }
+                if (pending.playWhenReady) player.start();
+            } catch (IllegalStateException e) {
+                android.util.Log.e(TAG, "applying calls made while loading failed", e);
             }
-        });
-        mp.setOnErrorListener((player, what, extra) -> {
-            synchronized (sLock) {
-                if (sPending.get(id) == pending) sPending.remove(id);
-                sErrors.put(id, "MediaPlayer error " + what + " (" + extra + ")");
-            }
-            return true;
-        });
-        mp.prepareAsync();
+        }
+    }
+
+    /** Record a load or playback error, unless a newer source replaced {@code pending}. */
+    private static void fail(int id, Pending pending, String reason) {
+        synchronized (sLock) {
+            Pending current = sPending.get(id);
+            if (current != null && current != pending) return;
+            sPending.remove(id);
+            sErrors.put(id, reason);
+        }
     }
 
     /** Whether the player is still preparing. */
@@ -560,18 +604,22 @@ public final class GpuiVideoPlayer {
             sErrors.remove(id);
         }
         if (mp != null) {
-            try {
-                mp.setSurface(null);
-            } catch (Exception ignored) {
-            }
-            try {
-                mp.stop();
-            } catch (Exception ignored) {
-            }
-            try {
-                mp.release();
-            } catch (Exception ignored) {
-            }
+            // On the worker: after any source change still in flight, and off the
+            // caller's thread (release waits for the decoder).
+            sWorker.execute(() -> {
+                try {
+                    mp.setSurface(null);
+                } catch (Exception ignored) {
+                }
+                try {
+                    mp.stop();
+                } catch (Exception ignored) {
+                }
+                try {
+                    mp.release();
+                } catch (Exception ignored) {
+                }
+            });
         }
     }
 
