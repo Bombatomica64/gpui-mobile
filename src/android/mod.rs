@@ -151,6 +151,7 @@ pub fn size<T>(width: T, height: T) -> Size<T> {
 
 mod accessibility;
 mod accesskit_adapter;
+mod autofill;
 pub mod dispatcher;
 pub mod display;
 mod document_picker;

@@ -2010,12 +2010,14 @@ pub fn show_keyboard_android(keyboard_type: crate::KeyboardType) {
     }) {
         log::warn!("IME requires GpuiInputActivity: {error}");
     }
+    super::autofill::begin();
 }
 
 /// Hide the software keyboard on Android.
 ///
 /// Invalidates queued IME callbacks and clears the native composition buffer.
 pub fn hide_keyboard_android() {
+    super::autofill::end();
     *SHOWN_KEYBOARD.lock().expect("poisoned") = None;
     *DISMISSED_KEYBOARD.lock().expect("poisoned") = None;
     let session = super::text_input::new_session();
