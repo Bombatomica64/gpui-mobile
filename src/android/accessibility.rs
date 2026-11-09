@@ -36,7 +36,10 @@ use accesskit_android::jni::{
     JNIEnv, JavaVM,
 };
 use gpui::{
-    accesskit::{ActionHandler, ActionRequest, ActivationHandler, TreeUpdate},
+    accesskit::{
+        Action, ActionData, ActionHandler, ActionRequest, ActivationHandler, NodeId, TreeId,
+        TreeUpdate,
+    },
     A11yCallbacks,
 };
 
@@ -122,6 +125,7 @@ pub(super) fn init(callbacks: &Handlers) {
 
 /// `PlatformWindow::a11y_tree_update`, on the GPUI thread that called [`init`].
 pub(super) fn update(callbacks: &Handlers, tree: TreeUpdate) {
+    super::autofill::tree_updated(&tree);
     // Outside the lock: a JNI call every frame should not hold up `init`.
     let enabled = is_accessibility_enabled();
     let mut bridge = BRIDGE.lock().expect("poisoned");
@@ -142,10 +146,53 @@ pub(super) fn update(callbacks: &Handlers, tree: TreeUpdate) {
         }
         return;
     }
+    if super::autofill::wanted() {
+        return;
+    }
     // The screen reader has gone. Stop GPUI building trees, and swap in an adapter
     // that is not yet active, so the next screen reader activates GPUI again.
     bridge.callbacks.deactivate();
     bridge.attach();
+}
+
+/// Ask the active window to build its tree for autofill, whether or not a screen reader
+/// is running.
+pub(super) fn request_tree() {
+    let callbacks = BRIDGE
+        .lock()
+        .expect("poisoned")
+        .as_ref()
+        .map(|bridge| bridge.callbacks.clone());
+    if let Some(mut callbacks) = callbacks {
+        let _ = callbacks.request_initial_tree();
+    }
+}
+
+/// Autofill is done with the tree: stop building it unless a screen reader still needs it.
+pub(super) fn release_tree() {
+    if is_accessibility_enabled() {
+        return;
+    }
+    if let Some(bridge) = BRIDGE.lock().expect("poisoned").as_ref() {
+        bridge.callbacks.deactivate();
+    }
+}
+
+/// Set a field's text through its `SetValue` action.
+pub(super) fn set_value(node: NodeId, value: String) {
+    let callbacks = BRIDGE
+        .lock()
+        .expect("poisoned")
+        .as_ref()
+        .map(|bridge| bridge.callbacks.clone());
+    if let Some(mut callbacks) = callbacks {
+        callbacks.do_action(ActionRequest {
+            action: Action::SetValue,
+            target_tree: TreeId::ROOT,
+            target_node: node,
+            data: Some(ActionData::Value(value.into())),
+        });
+    }
 }
 
 /// The window is closing: drop its adapter, which takes the delegate off its view, so
