@@ -1396,10 +1396,11 @@ impl AndroidWindow {
         config: WgpuSurfaceConfig,
         backends: wgpu::Backends,
     ) -> std::result::Result<WgpuRenderer, FreshRendererError> {
-        let context = Self::create_context(raw, backends).map_err(|error| FreshRendererError {
-            backend: wgpu::Backend::Noop,
-            error,
-        })?;
+        let context =
+            Self::create_context(raw, &config, backends).map_err(|error| FreshRendererError {
+                backend: wgpu::Backend::Noop,
+                error,
+            })?;
         let backend = match context.backend() {
             gpui_wgpu::WgpuBackend::Native(backend) => backend,
             _ => wgpu::Backend::Gl,
@@ -1441,6 +1442,7 @@ impl AndroidWindow {
     /// A `WgpuContext` restricted to `backends`, probed against `raw`.
     fn create_context(
         raw: &RawAndroidWindow,
+        config: &WgpuSurfaceConfig,
         backends: wgpu::Backends,
     ) -> Result<gpui_wgpu::WgpuContext> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -1461,7 +1463,7 @@ impl AndroidWindow {
         // releases the window before the renderer creates its own surface.
         let surface = unsafe { instance.create_surface_unsafe(target) }
             .context("failed to create a probe surface")?;
-        gpui_wgpu::WgpuContext::new(instance, &surface, None)
+        gpui_wgpu::WgpuContext::new(instance, &surface, config, None)
     }
 }
 
