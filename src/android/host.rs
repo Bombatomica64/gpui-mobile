@@ -58,6 +58,8 @@
 //! `gpuiShowKeyboardWithInputType(int inputType, int imeOptions, long session)` gets
 //! the focused field's `EditorInfo` values (from GPUI's `TextInputConfiguration`) to
 //! apply to its proxy, instead of a bare keyboard type.
+//! A host with `gpuiUpdateCursorAnchor(float x, float top, float baseline, float bottom)`
+//! receives the caret in surface pixels, to answer `requestCursorUpdates` on its proxy.
 //!
 //! # Threading contract
 //!
