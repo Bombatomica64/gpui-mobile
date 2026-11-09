@@ -1142,6 +1142,7 @@ impl AndroidWindow {
                 bottom: gpui::px(state.ime_inset / state.scale_factor),
                 ..Default::default()
             },
+            corner_radii: gpui::Corners::default(),
         }
     }
 
