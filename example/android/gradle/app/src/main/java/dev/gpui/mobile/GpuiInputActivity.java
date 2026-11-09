@@ -2,6 +2,7 @@ package dev.gpui.mobile;
 
 import android.app.NativeActivity;
 import android.content.pm.PackageManager;
+import android.graphics.Matrix;
 import android.os.Bundle;
 import android.text.Editable;
 import android.text.InputType;
@@ -10,6 +11,7 @@ import android.text.TextWatcher;
 import android.view.KeyEvent;
 import android.view.ViewGroup;
 import android.view.inputmethod.BaseInputConnection;
+import android.view.inputmethod.CursorAnchorInfo;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputConnection;
 import android.view.inputmethod.InputConnectionWrapper;
@@ -86,10 +88,22 @@ public class GpuiInputActivity extends NativeActivity {
         });
     }
 
+    /**
+     * The caret moved, in pixels of the surface GPUI draws to. gpui-mobile calls this
+     * from update_ime_position; the keyboard only hears about it if it asked.
+     */
+    public void gpuiUpdateCursorAnchor(float x, float top, float baseline, float bottom) {
+        runOnUiThread(() -> {
+            if (input != null) input.caretMoved(x, top, baseline, bottom);
+        });
+    }
+
     private final class InputProxy extends EditText {
         private long session;
         private int depth;
         private boolean marked;
+        private float[] caret;
+        private int cursorUpdates;
         /** Report the keyboard's action key as IME event 6 instead of a Done / newline. */
         boolean reportsActions;
 
@@ -175,11 +189,56 @@ public class GpuiInputActivity extends NativeActivity {
             }
         }
 
+        void caretMoved(float x, float top, float baseline, float bottom) {
+            caret = new float[] {x, top, baseline, bottom};
+            if (cursorUpdates != 0) reportCaret();
+        }
+
+        /** Answers InputConnection.requestCursorUpdates for the current connection. */
+        private boolean requestCaretUpdates(int mode) {
+            cursorUpdates = mode & (InputConnection.CURSOR_UPDATE_IMMEDIATE
+                    | InputConnection.CURSOR_UPDATE_MONITOR);
+            if (caret != null && (cursorUpdates & InputConnection.CURSOR_UPDATE_IMMEDIATE) != 0) {
+                reportCaret();
+            }
+            return true;
+        }
+
+        private void reportCaret() {
+            cursorUpdates &= ~InputConnection.CURSOR_UPDATE_IMMEDIATE;
+            int[] origin = new int[2];
+            getWindow().getDecorView().getLocationOnScreen(origin);
+            Matrix surfaceToScreen = new Matrix();
+            surfaceToScreen.setTranslate(origin[0], origin[1]);
+            Editable text = getText();
+            CursorAnchorInfo.Builder info = new CursorAnchorInfo.Builder()
+                    .setMatrix(surfaceToScreen)
+                    .setSelectionRange(Selection.getSelectionStart(text), Selection.getSelectionEnd(text))
+                    .setInsertionMarkerLocation(caret[0], caret[1], caret[2], caret[3],
+                            CursorAnchorInfo.FLAG_HAS_VISIBLE_REGION);
+            int composingStart = BaseInputConnection.getComposingSpanStart(text);
+            if (composingStart >= 0) {
+                info.setComposingText(composingStart,
+                        text.subSequence(composingStart, BaseInputConnection.getComposingSpanEnd(text)));
+            }
+            ((InputMethodManager) getSystemService(INPUT_METHOD_SERVICE))
+                    .updateCursorAnchorInfo(this, info.build());
+        }
+
         @Override public InputConnection onCreateInputConnection(EditorInfo info) {
             InputConnection connection = super.onCreateInputConnection(info);
             if (connection == null) return null;
+            cursorUpdates = 0;
             final long connectionSession = session;
             return new InputConnectionWrapper(connection, false) {
+                // Not super: TextView would report this hidden 1x1 widget as the caret.
+                @Override public boolean requestCursorUpdates(int mode) {
+                    if (connectionSession != session) return false;
+                    return requestCaretUpdates(mode);
+                }
+                @Override public boolean requestCursorUpdates(int mode, int filter) {
+                    return requestCursorUpdates(mode);
+                }
                 @Override public boolean beginBatchEdit() {
                     if (connectionSession != session) return false;
                     depth++;
