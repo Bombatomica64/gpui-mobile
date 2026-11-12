@@ -1,8 +1,17 @@
 //! Embedded maps for Android and iOS.
 //!
 //! Provides a cross-platform embedded map view backed by:
-//! - Android: Android MapView (via platform view system)
-//! - iOS: MKMapView via Objective-C (via platform view system)
+//! - Android: `GpuiMapView`, a tile map drawn from OpenStreetMap raster tiles
+//!   (or any `{z}/{x}/{y}` tile URL): no SDK, no API key. Pan, pinch and
+//!   double-tap zoom, markers with a title bubble on tap, attribution shown.
+//!   OpenStreetMap's tiles are for light use
+//!   (<https://operations.osmfoundation.org/policies/tiles/>); apps with real
+//!   traffic set [`MapSettings::tile_url`] to their own or a commercial server.
+//! - iOS: MKMapView via Objective-C (via platform view system; the controls
+//!   are not implemented yet)
+//!
+//! Embed the view with
+//! `components::platform_view_element::platform_view_element(map.platform_view_handle()?)`.
 //!
 //! Unlike `maps_launcher` which opens an external app, this package
 //! embeds an interactive map directly in the GPUI render tree.
@@ -54,8 +63,14 @@ pub struct MapSettings {
     pub scroll_gestures_enabled: bool,
     /// Enable rotate gestures.
     pub rotate_gestures_enabled: bool,
-    /// Show the user's location (requires permission).
+    /// Show the user's location (requires permission). Not drawn on Android yet.
     pub my_location_enabled: bool,
+    /// Android: the tile URL template, with `{z}`, `{x}` and `{y}`. `None` uses
+    /// OpenStreetMap's standard tiles.
+    pub tile_url: Option<String>,
+    /// Android: the credit drawn in the map's corner. `None` credits
+    /// OpenStreetMap; set it when `tile_url` points elsewhere.
+    pub attribution: Option<String>,
 }
 
 impl Default for MapSettings {
@@ -71,6 +86,8 @@ impl Default for MapSettings {
             scroll_gestures_enabled: true,
             rotate_gestures_enabled: true,
             my_location_enabled: false,
+            tile_url: None,
+            attribution: None,
         }
     }
 }
@@ -86,6 +103,13 @@ pub struct MapMarker {
     pub title: Option<String>,
     /// Snippet/subtitle shown in the info window.
     pub snippet: Option<String>,
+}
+
+/// Where the map looks, which changes as the user pans and zooms.
+#[derive(Debug, Clone, Copy)]
+pub struct MapCamera {
+    pub center: LatLng,
+    pub zoom: f64,
 }
 
 /// Handle to an embedded map view.
@@ -156,6 +180,15 @@ impl MapView {
             settings.my_location_enabled.to_string(),
         );
 
+        if let Some(url) = &settings.tile_url {
+            creation_params.insert("tile_url".to_string(), url.clone());
+        }
+        if let Some(attribution) = &settings.attribution {
+            creation_params.insert("attribution".to_string(), attribution.clone());
+        }
+        #[cfg(target_os = "android")]
+        android::set_map_type(0, settings.map_type)?;
+
         let params = PlatformViewParams {
             bounds: PlatformViewBounds::default(),
             creation_params,
@@ -173,6 +206,41 @@ impl MapView {
         self.platform_handle.clone()
     }
 
+    #[cfg(target_os = "android")]
+    fn view_id(&self) -> Result<i64, String> {
+        self.platform_handle
+            .as_ref()
+            .map(|view| view.id().0 as i64)
+            .ok_or_else(|| "The map view is disposed".to_string())
+    }
+
+    /// Where the map looks now, after the user's gestures.
+    pub fn camera(&self) -> Result<MapCamera, String> {
+        #[cfg(target_os = "android")]
+        {
+            android::camera(self.view_id()?)
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            Ok(MapCamera {
+                center: self.settings.center,
+                zoom: self.settings.zoom,
+            })
+        }
+    }
+
+    /// The marker whose title bubble the user opened by tapping it.
+    pub fn selected_marker(&self) -> Result<Option<String>, String> {
+        #[cfg(target_os = "android")]
+        {
+            android::selected_marker(self.view_id()?)
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            Ok(None)
+        }
+    }
+
     /// Set the map center coordinate.
     pub fn set_center(&mut self, center: LatLng) -> Result<(), String> {
         self.settings.center = center;
@@ -182,7 +250,7 @@ impl MapView {
         }
         #[cfg(target_os = "android")]
         {
-            android::set_center(center)
+            android::set_center(self.view_id()?, center)
         }
         #[cfg(not(any(target_os = "ios", target_os = "android")))]
         {
@@ -199,7 +267,7 @@ impl MapView {
         }
         #[cfg(target_os = "android")]
         {
-            android::set_zoom(zoom)
+            android::set_zoom(self.view_id()?, zoom)
         }
         #[cfg(not(any(target_os = "ios", target_os = "android")))]
         {
@@ -216,7 +284,7 @@ impl MapView {
         }
         #[cfg(target_os = "android")]
         {
-            android::set_map_type(map_type)
+            android::set_map_type(self.view_id()?, map_type)
         }
         #[cfg(not(any(target_os = "ios", target_os = "android")))]
         {
@@ -232,7 +300,7 @@ impl MapView {
         }
         #[cfg(target_os = "android")]
         {
-            android::add_marker(marker)
+            android::add_marker(self.view_id()?, marker)
         }
         #[cfg(not(any(target_os = "ios", target_os = "android")))]
         {
@@ -249,7 +317,7 @@ impl MapView {
         }
         #[cfg(target_os = "android")]
         {
-            android::remove_marker(marker_id)
+            android::remove_marker(self.view_id()?, marker_id)
         }
         #[cfg(not(any(target_os = "ios", target_os = "android")))]
         {
@@ -266,7 +334,7 @@ impl MapView {
         }
         #[cfg(target_os = "android")]
         {
-            android::clear_markers()
+            android::clear_markers(self.view_id()?)
         }
         #[cfg(not(any(target_os = "ios", target_os = "android")))]
         {
