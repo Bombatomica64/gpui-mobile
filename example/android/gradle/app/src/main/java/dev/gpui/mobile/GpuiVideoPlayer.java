@@ -6,6 +6,8 @@ import android.media.PlaybackParams;
 import android.net.Uri;
 import android.os.Build;
 import android.util.SparseArray;
+import android.util.SparseBooleanArray;
+import android.util.SparseIntArray;
 import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
@@ -68,6 +70,19 @@ public final class GpuiVideoPlayer {
     /** Players whose source failed to load, with the reason. */
     private static final SparseArray<String> sErrors = new SparseArray<>();
 
+    /**
+     * Players that played their source to the end, until play, seek or a new
+     * source. MediaPlayer's own state can't tell this from a pause. Guarded by
+     * {@code sLock}.
+     */
+    private static final SparseBooleanArray sCompleted = new SparseBooleanArray();
+
+    /**
+     * Which source each player is on, so a completion or error queued for the
+     * previous source doesn't land on the new one. Guarded by {@code sLock}.
+     */
+    private static final SparseIntArray sSource = new SparseIntArray();
+
     // State codes for getState (must match Rust's video_player::android).
     private static final int STATE_LOADING = 1;
     private static final int STATE_READY = 2;
@@ -119,10 +134,12 @@ public final class GpuiVideoPlayer {
 
         Pending pending = new Pending();
         MediaPlayer mp;
+        int source;
         synchronized (sLock) {
             mp = player(id);
             sErrors.remove(id);
             sPending.put(id, pending);
+            source = nextSource(id);
         }
         // Even reset() and setDataSource() take tens of ms (tearing down a
         // prepared decoder, opening the connection), so they run on the worker too.
@@ -133,6 +150,7 @@ public final class GpuiVideoPlayer {
             }
             try {
                 mp.reset();
+                listen(id, mp, source);
                 mp.setOnPreparedListener(player -> onPrepared(id, pending, player));
                 mp.setOnErrorListener((player, what, extra) -> {
                     fail(id, pending, "MediaPlayer error " + what + " (" + extra + ")");
@@ -169,14 +187,26 @@ public final class GpuiVideoPlayer {
     /** Load and prepare a local source on the worker, and wait for it. */
     private static String loadNow(int id, Source source) throws Exception {
         MediaPlayer mp;
+        int current;
         synchronized (sLock) {
             mp = player(id);
             sPending.remove(id);
             sErrors.remove(id);
+            current = nextSource(id);
         }
         try {
             return sWorker.submit(() -> {
                 mp.reset();
+                listen(id, mp, current);
+                // Without it, a playback error ends in onCompletion.
+                mp.setOnErrorListener((player, what, extra) -> {
+                    synchronized (sLock) {
+                        if (sSource.get(id) == current) {
+                            sErrors.put(id, "MediaPlayer error " + what + " (" + extra + ")");
+                        }
+                    }
+                    return true;
+                });
                 source.set(mp);
                 mp.prepare();
                 return mp.getDuration() + "|" + mp.getVideoWidth() + "|" + mp.getVideoHeight();
@@ -184,6 +214,32 @@ public final class GpuiVideoPlayer {
         } catch (ExecutionException e) {
             Throwable cause = e.getCause();
             throw cause instanceof Exception ? (Exception) cause : e;
+        }
+    }
+
+    /**
+     * Start a new source for this player: forget that the old one completed, and
+     * return the new source's number. Call with {@code sLock} held.
+     */
+    private static int nextSource(int id) {
+        sCompleted.delete(id);
+        int source = sSource.get(id) + 1;
+        sSource.put(id, source);
+        return source;
+    }
+
+    /** Record when {@code source} plays to the end. */
+    private static void listen(int id, MediaPlayer mp, int source) {
+        mp.setOnCompletionListener(player -> {
+            synchronized (sLock) {
+                if (sSource.get(id) == source) sCompleted.put(id, true);
+            }
+        });
+    }
+
+    private static void clearCompleted(int id) {
+        synchronized (sLock) {
+            sCompleted.delete(id);
         }
     }
 
@@ -263,7 +319,9 @@ public final class GpuiVideoPlayer {
         }
         if (mp != null) {
             if (whenPrepared(id, pending -> pending.playWhenReady = true)) return;
+            clearCompleted(id);
             try {
+                // From the end, this starts over.
                 mp.start();
             } catch (Exception e) {
                 android.util.Log.e(TAG, "play failed", e);
@@ -299,6 +357,7 @@ public final class GpuiVideoPlayer {
         }
         if (mp != null) {
             if (whenPrepared(id, pending -> pending.seekMs = ms)) return;
+            clearCompleted(id);
             try {
                 seekTo(mp, ms);
             } catch (Exception e) {
@@ -465,19 +524,21 @@ public final class GpuiVideoPlayer {
     public static int getState(int id) {
         MediaPlayer mp;
         String error;
+        boolean loading;
+        boolean completed;
         synchronized (sLock) {
             mp = sPlayers.get(id);
             error = sErrors.get(id);
+            loading = sPending.get(id) != null;
+            completed = sCompleted.get(id);
         }
         if (mp == null) throw new IllegalArgumentException("No video player " + id);
         if (error != null) throw new IllegalStateException(error);
-        if (preparing(id)) return STATE_LOADING;
+        if (loading) return STATE_LOADING;
+        if (completed) return STATE_COMPLETED;
         try {
             if (mp.isPlaying()) return STATE_PLAYING;
-            int position = mp.getCurrentPosition();
-            int duration = mp.getDuration();
-            if (duration > 0 && position >= duration) return STATE_COMPLETED;
-            return position > 0 ? STATE_PAUSED : STATE_READY;
+            return mp.getCurrentPosition() > 0 ? STATE_PAUSED : STATE_READY;
         } catch (IllegalStateException e) {
             return STATE_READY;
         }
@@ -602,6 +663,8 @@ public final class GpuiVideoPlayer {
             sPlayers.remove(id);
             sPending.remove(id);
             sErrors.remove(id);
+            sCompleted.delete(id);
+            sSource.delete(id);
         }
         if (mp != null) {
             // On the worker: after any source change still in flight, and off the
