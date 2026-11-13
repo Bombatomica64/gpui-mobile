@@ -31,6 +31,8 @@ pub enum VideoPlayerState {
     Ready,
     Playing,
     Paused,
+    /// Played to the end (never while looping). `play` starts over; `seek` leaves
+    /// it paused at the new position.
     Completed,
 }
 

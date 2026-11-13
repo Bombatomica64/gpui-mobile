@@ -19,10 +19,14 @@ pub enum PlayerState {
     Ready,
     Playing,
     Paused,
+    /// Played to the end (never while looping). `play` starts over; `seek` and
+    /// `stop` leave it paused or ready.
     Completed,
 }
 
 /// Loop mode.
+///
+/// A player has a single source, so `One` and `All` both repeat it.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum LoopMode {
     #[default]
