@@ -42,9 +42,9 @@ pub fn set_zoom(view: i64, zoom: f64) -> Result<(), String> {
 pub fn set_map_type(_view: i64, map_type: MapType) -> Result<(), String> {
     match map_type {
         MapType::Normal => Ok(()),
-        // The tile view draws one tile source; set `MapSettings::tile_url` instead.
+        // The tile view draws one tile source; pick another with TileMapProvider::new.
         other => Err(format!(
-            "{other:?} maps need a tile source: set MapSettings::tile_url"
+            "tile maps have no {other:?} type: use another tile server"
         )),
     }
 }
