@@ -81,11 +81,12 @@ impl AndroidPlatformView {
             let height = bounds.height;
             drop(bounds);
 
-            // Serialize creation_params as "key1=value1|key2=value2"
+            // "key1=value1|key2=value2", with `%` and `|` escaped so values (HTML,
+            // URLs) may contain them.
             let creation_params_str: String = params
                 .creation_params
                 .iter()
-                .map(|(k, v)| format!("{}={}", k, v))
+                .map(|(k, v)| format!("{}={}", escape_param(k), escape_param(v)))
                 .collect::<Vec<_>>()
                 .join("|");
             let creation_params_jstr = env.new_string(&creation_params_str).e()?;
@@ -299,6 +300,11 @@ impl PlatformView for AndroidPlatformView {
     fn is_disposed(&self) -> bool {
         self.disposed.load(Ordering::Relaxed)
     }
+}
+
+/// Escape a creation parameter for `GpuiPlatformView.parseCreationParams`.
+fn escape_param(value: &str) -> String {
+    value.replace('%', "%25").replace('|', "%7C")
 }
 
 /// Generic Android platform view factory.

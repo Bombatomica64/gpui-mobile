@@ -174,7 +174,8 @@ public class GpuiPlatformView {
 
     /**
      * Parse a pipe-delimited creation params string into a map.
-     * Format: "key1=value1|key2=value2"
+     * Format: "key1=value1|key2=value2", with "%" and "|" in keys and values
+     * escaped as "%25" and "%7C".
      */
     private static Map<String, String> parseCreationParams(String params) {
         Map<String, String> map = new HashMap<>();
@@ -182,10 +183,14 @@ public class GpuiPlatformView {
         for (String pair : params.split("\\|")) {
             int eq = pair.indexOf('=');
             if (eq > 0) {
-                map.put(pair.substring(0, eq), pair.substring(eq + 1));
+                map.put(unescape(pair.substring(0, eq)), unescape(pair.substring(eq + 1)));
             }
         }
         return map;
+    }
+
+    private static String unescape(String value) {
+        return value.replace("%7C", "|").replace("%25", "%");
     }
 
     private static View createViewForType(
