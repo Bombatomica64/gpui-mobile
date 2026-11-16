@@ -53,14 +53,6 @@ impl Styled for PlatformViewElement {
     }
 }
 
-impl IntoElement for PlatformViewElement {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
-
 /// Kept in the element's state while it is painted; GPUI drops the state of an
 /// element that wasn't painted in a frame, which hides the view.
 struct OnScreen(Weak<PlatformViewHandle>);
