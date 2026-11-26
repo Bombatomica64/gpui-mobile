@@ -1,8 +1,9 @@
 //! Android Autofill for GPUI text fields.
 //!
 //! GPUI draws every field itself, so password managers see one opaque `SurfaceView`. A
-//! host that uses `GpuiAutofillSurfaceView` exposes the fields as virtual children of
-//! that view, and this module feeds it.
+//! host that uses `GpuiAutofill` exposes the fields as virtual children of its IME proxy
+//! (the view the keyboard is connected to, which Android requires for a fill request to
+//! reach the service), and this module feeds it.
 //!
 //! The field list comes from GPUI's AccessKit tree, which already has each field's
 //! role, label, bounds and focus. GPUI builds that tree only when something asks for
@@ -11,8 +12,13 @@
 //! screen reader uses, so any input that handles it (Kit's do) works.
 //!
 //! Nothing is sent unless a field on screen looks like a login or contact field, so
-//! the text of an ordinary form never reaches the autofill service. Masked fields
-//! report no value, and values are never logged.
+//! the text of an ordinary form never reaches the autofill service. The tree carries no
+//! value for a masked field, so while one has focus its text is read from the window's
+//! input handler ([`needs_focused_text`]/[`focused_text`]): without it a password
+//! manager has nothing to save. Values are never logged.
+//!
+//! When the keyboard goes away after a password was typed, the host commits the
+//! autofill session, which is when Android offers to save the login.
 
 use std::{
     collections::HashMap,
@@ -22,7 +28,7 @@ use std::{
 use gpui::accesskit::{Node, NodeId, Role, TreeUpdate};
 use jni::objects::{JObject, JValue};
 
-use super::jni::{activity, with_env, JniExt, JniResultExt};
+use super::jni::{JniExt, JniResultExt, activity, with_env};
 
 const HINT_PASSWORD: &str = "password";
 const HINT_USERNAME: &str = "username";
@@ -40,6 +46,8 @@ struct Field {
     label: String,
     value: Option<String>,
     focused: bool,
+    /// The tree hides this field's value (a password); see [`focused_text`].
+    masked: bool,
 }
 
 #[derive(Default)]
@@ -50,6 +58,8 @@ struct State {
     nodes: HashMap<i32, NodeId>,
     /// What the host last received, to send only changes.
     sent: Vec<(i32, Field)>,
+    /// Text typed into masked fields during this keyboard session.
+    typed: HashMap<NodeId, String>,
 }
 
 impl State {
@@ -86,6 +96,7 @@ pub(super) fn end() {
     }
     state.wanted = false;
     state.sent.clear();
+    state.typed.clear();
     drop(state);
     if let Err(err) = send(&[]) {
         log::debug!("autofill: {err}");
@@ -103,7 +114,9 @@ pub(super) fn tree_updated(tree: &TreeUpdate) {
     if !state.wanted {
         return;
     }
-    let fields: Vec<(i32, Field)> = fields_in(tree)
+    let mut fields = fields_in(tree);
+    with_typed_text(&mut fields, &state.typed);
+    let fields: Vec<(i32, Field)> = fields
         .into_iter()
         .map(|field| (state.virtual_id(field.node), field))
         .collect();
@@ -114,6 +127,51 @@ pub(super) fn tree_updated(tree: &TreeUpdate) {
     drop(state);
     if let Err(err) = send(&fields) {
         log::debug!("autofill: {err}");
+    }
+}
+
+/// Whether the focused field is masked, so its text must come from [`focused_text`].
+pub(super) fn needs_focused_text() -> bool {
+    let state = STATE.lock().expect("poisoned");
+    state.wanted
+        && state
+            .sent
+            .iter()
+            .any(|(_, field)| field.focused && field.masked)
+}
+
+/// The text of the focused input, from the window's input handler, on the GPUI thread
+/// after a frame. Kept for the focused masked field only.
+pub(super) fn focused_text(text: Option<String>) {
+    let mut state = STATE.lock().expect("poisoned");
+    if !state.wanted {
+        return;
+    }
+    let text = text.unwrap_or_default();
+    let Some(index) = state
+        .sent
+        .iter()
+        .position(|(_, field)| field.focused && field.masked)
+    else {
+        return;
+    };
+    let node = state.sent[index].1.node;
+    if state.typed.get(&node) == Some(&text) {
+        return;
+    }
+    state.typed.insert(node, text.clone());
+    state.sent[index].1.value = Some(text);
+    let fields = state.sent.clone();
+    drop(state);
+    if let Err(err) = send(&fields) {
+        log::debug!("autofill: {err}");
+    }
+}
+
+/// Give masked fields the text typed into them; the tree has none.
+fn with_typed_text(fields: &mut [Field], typed: &HashMap<NodeId, String>) {
+    for field in fields.iter_mut().filter(|field| field.masked) {
+        field.value = typed.get(&field.node).cloned();
     }
 }
 
@@ -140,7 +198,8 @@ fn fields_in(tree: &TreeUpdate) -> Vec<Field> {
                 .unwrap_or_default()
                 .to_string();
             let hint = declared_hint(node.role(), node.author_id().unwrap_or_default(), &label);
-            let value = node.value().map(str::to_string);
+            let masked = node.role() == Role::PasswordInput;
+            let value = node.value().map(str::to_string).filter(|_| !masked);
             let field = Field {
                 node: *id,
                 bounds,
@@ -148,6 +207,7 @@ fn fields_in(tree: &TreeUpdate) -> Vec<Field> {
                 label,
                 value,
                 focused: *id == tree.focus,
+                masked,
             };
             Some((field, node.role()))
         })
@@ -294,7 +354,7 @@ fn send(fields: &[(i32, Field)]) -> Result<(), String> {
 /// # Safety
 /// Called by JNI with valid array references.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiAutofillSurfaceView_nativeFill(
+pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiAutofill_nativeFill(
     _env: *mut std::ffi::c_void,
     _class: *mut std::ffi::c_void,
     ids: *mut std::ffi::c_void,
@@ -396,6 +456,23 @@ mod tests {
             1,
         ));
         assert!(fields.is_empty());
+    }
+
+    #[test]
+    fn masked_fields_take_the_typed_text() {
+        let mut fields = fields_in(&tree(
+            vec![
+                (1, input(Role::TextInput, 0.0, "Username")),
+                (2, input(Role::PasswordInput, 50.0, "Password")),
+            ],
+            2,
+        ));
+        assert!(fields[1].masked && fields[1].value.is_none());
+        let typed = HashMap::from([(NodeId(2), "hunter2".to_string()), (NodeId(1), "x".into())]);
+        with_typed_text(&mut fields, &typed);
+        assert_eq!(fields[1].value.as_deref(), Some("hunter2"));
+        // Only masked fields: a plain field keeps what the tree says.
+        assert_eq!(fields[0].value, None);
     }
 
     #[test]

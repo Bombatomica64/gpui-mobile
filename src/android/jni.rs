@@ -1922,6 +1922,9 @@ pub(crate) fn keyboard_hidden_by_user() {
     let shown = SHOWN_KEYBOARD.lock().expect("poisoned").take();
     if shown.is_some() {
         *DISMISSED_KEYBOARD.lock().expect("poisoned") = shown;
+        // The form may be done, as when the keyboard is hidden for good; a tap on the
+        // field brings both back.
+        super::autofill::end();
     }
 }
 
