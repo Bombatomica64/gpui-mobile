@@ -1733,6 +1733,10 @@ impl PlatformWindow for AndroidPlatformWindow {
                 (ime_input_callback.lock())(input);
             });
             callback(options);
+            // After the frame, so the handler and the tree's focus are the same field's.
+            if super::autofill::needs_focused_text() {
+                super::autofill::focused_text(super::text_input::full_text(&input_handler));
+            }
         });
         // PlatformWindow gives us Box<dyn FnMut(...)> (not Send).
         // AndroidWindow::on_request_frame requires Send.  On Android the

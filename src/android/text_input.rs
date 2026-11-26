@@ -125,6 +125,19 @@ pub(super) fn drain(
     }
 }
 
+/// The whole text of the focused input, if any.
+pub(super) fn full_text(slot: &Rc<RefCell<Option<PlatformInputHandler>>>) -> Option<String> {
+    // No RefCell borrow spans the call into GPUI, as in `drain`.
+    let mut handler = slot.borrow_mut().take()?;
+    let mut adjusted = None;
+    let text = handler.text_for_range(0..usize::MAX, &mut adjusted);
+    let mut current = slot.borrow_mut();
+    if current.is_none() {
+        *current = Some(handler);
+    }
+    text
+}
+
 pub(super) fn finish_composition(slot: &Rc<RefCell<Option<PlatformInputHandler>>>) {
     if !COMPOSING.swap(false, Ordering::AcqRel) {
         return;
